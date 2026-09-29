@@ -1,0 +1,5 @@
+# Add these entries to local.properties. This is a separate Gemini key, not the Maps key.
+GEMINI_API_KEY=
+GEMINI_MODEL=gemini-2.5-flash
+DEEPSEEK_API_KEY=
+DEEPSEEK_MODEL=deepseek-flash
