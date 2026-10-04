@@ -28,6 +28,7 @@ internal val InfeasibleRed = Color(0xFFB3261E)
 
 @Composable internal fun InsertionFeasibilityDialog(message: LineMessage, rides: List<RideOrder>, onDismiss: () -> Unit, onEvaluated: (InsertionResult) -> Unit) {
     val context = LocalContext.current
+    val terms = remember { LocationTermsStore(context).load() }
     val scope = rememberCoroutineScope()
     val source = remember { MessageStore.get(context).currentSource() }
     var showDate by remember { mutableStateOf(false) }
@@ -62,12 +63,12 @@ internal val InfeasibleRed = Color(0xFFB3261E)
         job = scope.launch {
             try {
                 status = "解析插單起訖點與接客時間…"
-                try { case = InsertionAnalysis.analyze(context, source, message, force).case ?: error("訊息解析失敗，請重試或手動填寫") }
+                try { case = (InsertionAnalysis.analyze(context, source, message, force).case ?: error("訊息解析失敗，請重試或手動填寫")).translated(terms) }
                 catch (e: CancellationException) { throw e }
                 catch (e: Exception) { error = "${e.message ?: "辨識失敗"}；可直接手動填寫" }
                 result = InsertionAnalysis.entries.value[source to message.seq]?.result?.takeIf { it.isFresh(latestRides) }
                 plan = result?.plan ?: evaluator.prepare(latestRides, Instant.now())
-                result?.let { case = it.case; buffer = it.bufferMinutes.toString() }
+                result?.let { case = it.case.translated(terms); buffer = it.bufferMinutes.toString() }
                 status = "資料可修正，請確認後評估"
             } catch (e: CancellationException) { status = "已取消" }
             catch (e: Exception) { error = e.message ?: "排程資料不足"; status = "" }
@@ -117,6 +118,7 @@ internal val InfeasibleRed = Color(0xFFB3261E)
             }
             if (showDate) OutlinedTextField(case.date, { case = case.copy(date = it); result = null; edited = true }, label = { Text("日期 YYYY-MM-DD") }, singleLine = true, enabled = !busy, modifier = Modifier.fillMaxWidth())
             FilterChip(selected = case.asap, onClick = { case = case.copy(asap = !case.asap); result = null; edited = true }, enabled = !busy, label = { Text("即時可等") })
+            if (case.asap) Text("以評估當下時間作為最早接客時間", style = MaterialTheme.typography.bodySmall)
             if (!case.asap) OutlinedTextField(case.time, { case = case.copy(time = it); result = null; edited = true }, label = { Text("時間 HH:mm 或 HH:mm–HH:mm") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), textStyle = MaterialTheme.typography.bodySmall)
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.SpaceBetween) {
@@ -124,12 +126,12 @@ internal val InfeasibleRed = Color(0xFFB3261E)
                 TextButton(enabled = !busy, onClick = { manualOrigin = !manualOrigin; result = null; edited = true }) { Text(if (manualOrigin) "改用自動" else "手動修改") }
             }
             if (manualOrigin) OutlinedTextField(origin, { origin = it; result = null; edited = true }, label = { Text("出發地址") }, enabled = !busy, modifier = Modifier.fillMaxWidth(), textStyle = MaterialTheme.typography.bodySmall)
-            else Text(plan?.active?.destination ?: if (plan != null) "現在位置" else "判斷中…", style = MaterialTheme.typography.bodySmall)
+            else Text(plan?.active?.destination?.let(terms::expand) ?: if (plan != null) "現在位置" else "判斷中…", style = MaterialTheme.typography.bodySmall)
             plan?.let { schedule ->
                 Text(if (schedule.active != null) "${insertionClock(schedule.availableAt)} 可出發 · 目前行程下車後" else "現在可出發", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             Text("4. 下一趟", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 4.dp))
-            Text(plan?.let { schedule -> schedule.next?.let { "${insertionClock(schedule.nextAt!!)} 接客 · ${it.pickup}" } ?: "無待接行程" } ?: "判斷中…", style = MaterialTheme.typography.bodySmall)
+            Text(plan?.let { schedule -> schedule.next?.let { "${insertionClock(schedule.nextAt!!)} 接客 · ${terms.expand(it.pickup)}" } ?: "無待接行程" } ?: "判斷中…", style = MaterialTheme.typography.bodySmall)
             TextButton(onClick = { showOptions = !showOptions }) { Text(if (showOptions) "收起緩衝設定" else "上下車各 $buffer 分鐘 · 修改") }
             if (showOptions) {
                 OutlinedTextField(buffer, { buffer = it; result = null; edited = true }, label = { Text("上下車各預留分鐘") }, singleLine = true, enabled = !busy, modifier = Modifier.fillMaxWidth())
@@ -137,7 +139,7 @@ internal val InfeasibleRed = Color(0xFFB3261E)
             }
             HorizontalDivider(Modifier.padding(vertical = 4.dp))
             Text("5. 路程分析", style = MaterialTheme.typography.titleSmall)
-            fresh?.let { InsertionRouteTimeline(it) }
+            fresh?.let { InsertionRouteTimeline(it, terms) }
                 ?: Text(if (result == null) "尚未完成評估" else "結果已失效，請重新評估", style = MaterialTheme.typography.bodySmall)
             if (busy && status.isNotBlank()) Text(status, style = MaterialTheme.typography.bodySmall)
             if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
@@ -161,7 +163,7 @@ internal val InfeasibleRed = Color(0xFFB3261E)
 }
 
 /** Ordered stops with driving time between them; waiting and boarding time remain explicit. */
-@Composable private fun InsertionRouteTimeline(value: InsertionResult) {
+@Composable private fun InsertionRouteTimeline(value: InsertionResult, terms: LocationTerms) {
     val color = if (value.feasible) FeasibleGreen else InfeasibleRed
     val zone = ZoneId.systemDefault()
     fun time(at: Instant): String = at.atZone(zone).format(DateTimeFormatter.ofPattern(
@@ -176,14 +178,16 @@ internal val InfeasibleRed = Color(0xFFB3261E)
         }
         InsertionStop(time(value.plan.availableAt), "出發", if (value.origin.startsWith("現在位置")) "現在位置" else value.origin, color)
         InsertionLeg("開車 ${routeMinutes(value.toPickup.seconds)} 分鐘")
-        InsertionStop(time(value.pickupArrival), "抵達上車點", value.case.pickup, color)
+        InsertionStop(time(value.pickupArrival), "抵達上車點", terms.expand(value.case.pickup), color)
+        LocationTermComment(value.case.pickup)
         val waiting = Duration.between(value.pickupArrival, value.pickupStart).seconds
         if (waiting > 0) Text("等候至 ${time(value.pickupStart)} 接客", modifier = Modifier.padding(start = 20.dp), style = MaterialTheme.typography.labelSmall)
         InsertionLeg("上車 ${value.bufferMinutes} 分 ＋ 開車 ${routeMinutes(value.ride.seconds)} 分 ＋ 下車 ${value.bufferMinutes} 分")
-        InsertionStop(time(value.dropoffReady), "下車完成", value.case.destination, color)
+        InsertionStop(time(value.dropoffReady), "下車完成", terms.expand(value.case.destination), color)
+        LocationTermComment(value.case.destination)
         value.toNext?.let { leg ->
             InsertionLeg("開車 ${routeMinutes(leg.seconds)} 分鐘")
-            InsertionStop(time(value.nextArrival!!), "抵達下一趟", value.plan.next!!.pickup, color)
+            InsertionStop(time(value.nextArrival!!), "抵達下一趟", terms.expand(value.plan.next!!.pickup), color)
             Text("預約接客 ${time(value.plan.nextAt!!)}", modifier = Modifier.padding(start = 20.dp), style = MaterialTheme.typography.labelSmall)
         }
         Text("路況為估算 · 結果最長有效 5 分鐘", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)

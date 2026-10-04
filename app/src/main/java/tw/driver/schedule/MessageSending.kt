@@ -24,6 +24,11 @@ object MessageGateway {
     private var connection: LineFlowConnection? = null
     @Synchronized fun attach(key: String, value: LineFlowConnection) { source = key; connection = value }
     @Synchronized fun detach(value: LineFlowConnection?) { if (connection === value) { connection = null; source = "" } }
+    internal suspend fun screenshot(expectedSource: String): ServerScreenshot {
+        val receiver = synchronized(this) { connection.takeIf { source == expectedSource } }
+            ?: throw java.io.IOException("尚未連線，請先到設定 → Tab 6 開始接收")
+        return receiver.screenshot(expectedSource)
+    }
     suspend fun submit(context: Context, target: String, text: String, actionKey: String, expectedSource: String,
         retryId: String? = null): OutgoingMessage = withContext(Dispatchers.IO) {
         require(target.isNotBlank() && text.isNotBlank()) { "回報對象與內容不可空白" }

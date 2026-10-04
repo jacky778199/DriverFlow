@@ -31,7 +31,7 @@ object ScheduleSummaryHelper {
         }
         val dateHeader = "${date.format(DateTimeFormatter.ofPattern("yyyy/MM/dd"))} (週$dayOfWeekName)"
         val sb = StringBuilder()
-        sb.appendLine("【DriverRoutine 行程總結】")
+        sb.appendLine("【Driver Flow 行程總結】")
         sb.appendLine("📅 日期：$dateHeader")
         sb.appendLine("🚗 今日行程：共 ${sorted.size} 趟（已完成 ${sorted.count { it.completed }} 趟）")
         sb.appendLine("━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -150,7 +150,7 @@ object ScheduleSummaryHelper {
         // 1. 繪製頂部 Header
         val headerRect = RectF(margin, margin, width - margin, margin + headerHeight)
         canvas.drawRoundRect(headerRect, 28f, 28f, headerCardPaint)
-        canvas.drawText("DriverRoutine 行程總結", margin + 36f, margin + 80f, titlePaint)
+        canvas.drawText("Driver Flow 行程總結", margin + 36f, margin + 80f, titlePaint)
         canvas.drawText("$dateStr · 共 ${sorted.size} 趟接送行程", margin + 36f, margin + 140f, subTitlePaint)
 
         var curY = headerRect.bottom + spacing
@@ -229,7 +229,7 @@ object ScheduleSummaryHelper {
         }
 
         // 3. Footer
-        canvas.drawText("DriverRoutine · 專業接送服務 · 祝 行車平安", width / 2f, curY + 50f, footerPaint)
+        canvas.drawText("Driver Flow · 專業接送服務 · 祝 行車平安", width / 2f, curY + 50f, footerPaint)
 
         return bitmap
     }

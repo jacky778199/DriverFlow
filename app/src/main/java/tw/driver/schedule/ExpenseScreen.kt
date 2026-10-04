@@ -33,6 +33,7 @@ import org.json.JSONObject
 import java.time.DayOfWeek
 import java.time.LocalDate
 import java.time.LocalTime
+import java.time.temporal.ChronoUnit
 import java.time.format.DateTimeFormatter
 
 /**
@@ -42,9 +43,12 @@ data class ExpenseItem(
     val id: Long = System.nanoTime(),
     val date: String,             // 格式 "YYYY-MM-DD"
     val category: String,         // "加油", "停車費", "租車費用", "其他"
-    val amount: Int,              // 金額 (元)
+    val amountCents: Long = 0,    // 金額（分）；畫面顯示元
     val time: String = "",        // 記錄時間或加油時間，例如 "14:30"
-    val note: String = ""         // 備註說明
+    val note: String = "",        // 備註說明
+    val paidDate: String = date,
+    val paymentMethod: String = "現金",
+    val costEndDate: String = ""
 )
 
 /**
@@ -53,17 +57,36 @@ data class ExpenseItem(
 data class MonthlyRentalPlan(
     val model: String = "",          // 租車型號，例如 "Toyota Sienta 福祉車"
     val periodMonth: String = "",    // 租車月份/期間，例如 "2026-09"
-    val monthlyFee: Int = 0,         // 月租費用 (元)
+    val feeCents: Long = 0,          // 租期總費用（分）
     val daysInMonth: Int = 30,       // 計算天數 (例如 30)
-    val dailyCost: Int = 0,          // 每日成本 (元) = monthlyFee / daysInMonth
-    val note: String = ""            // 備註說明
+    val dailyCostCents: Long = 0,    // 試算基本分攤（分）；實際日期另外補足餘分
+    val note: String = "",           // 備註說明
+    val startDate: String = "",
+    val endDate: String = "",
+    val paidDate: String = "",
+    val paymentMethod: String = "轉帳",
+    val archivedPlans: List<MonthlyRentalPlan> = emptyList()
 )
+
+internal fun MonthlyRentalPlan.covers(date: LocalDate): Boolean {
+    if (feeCents <= 0) return false
+    val start = runCatching { LocalDate.parse(startDate) }.getOrNull()
+    val end = runCatching { LocalDate.parse(endDate) }.getOrNull()
+    if (start != null && end != null) return date in start..end
+    // Existing month-only plans remain valid until their dates are edited.
+    return periodMonth.isBlank() || periodMonth == date.format(DateTimeFormatter.ofPattern("yyyy-MM"))
+}
+
+/** Accrued ride revenue uses collected cash, tips and monthly billed amounts.
+ * Monthly collections reduce receivables and never add operating revenue a second time. */
+internal fun rideOperatingRevenue(ride: RideOrder): Long = operatingRevenueCents(ride)
 
 internal fun ExpenseItem.toJson() = JSONObject().apply {
     put("id", id)
     put("date", date)
     put("category", category)
-    put("amount", amount)
+    put("amountCents", amountCents)
+    put("paidDate", paidDate); put("paymentMethod", paymentMethod); put("costEndDate", costEndDate)
     put("time", time)
     put("note", note)
 }
@@ -72,7 +95,10 @@ internal fun JSONObject.toExpenseItem() = ExpenseItem(
     id = getLong("id"),
     date = getString("date"),
     category = getString("category"),
-    amount = getInt("amount"),
+    amountCents = if (has("amountCents")) getLong("amountCents") else getLong("amount") * 100,
+    paidDate = optString("paidDate", getString("date")),
+    paymentMethod = optString("paymentMethod", "現金"),
+    costEndDate = optString("costEndDate"),
     time = optString("time", ""),
     note = optString("note", "")
 )
@@ -85,7 +111,11 @@ data class WorkHourRecord(
     val departureTime: String,
     val returnHomeTime: String,
     val breakStartTime: String = "",
-    val breakEndTime: String = ""
+    val breakEndTime: String = "",
+    val startPoint: String = "",
+    val endPoint: String = "",
+    val startOdometer: String = "",
+    val endOdometer: String = ""
 )
 
 /**
@@ -102,18 +132,11 @@ internal fun exportExpenseData(
     rentalPlan: MonthlyRentalPlan,
     workHours: List<WorkHourRecord>
 ): String = JSONObject().apply {
-    put("schemaVersion", 1)
+    put("schemaVersion", 2)
     put("type", "driver_expenses")
     put("exportedAt", java.time.Instant.now().toString())
     put("expenses", JSONArray().apply { expenses.forEach { put(it.toJson()) } })
-    put("monthlyRentalPlan", JSONObject().apply {
-        put("model", rentalPlan.model)
-        put("periodMonth", rentalPlan.periodMonth)
-        put("monthlyFee", rentalPlan.monthlyFee)
-        put("daysInMonth", rentalPlan.daysInMonth)
-        put("dailyCost", rentalPlan.dailyCost)
-        put("note", rentalPlan.note)
-    })
+    put("monthlyRentalPlan", JSONObject(rentalPlanMap(rentalPlan)))
     put("workHours", JSONArray().apply {
         workHours.forEach { wh ->
             put(JSONObject().apply {
@@ -122,6 +145,10 @@ internal fun exportExpenseData(
                 put("returnHomeTime", wh.returnHomeTime)
                 put("breakStartTime", wh.breakStartTime)
                 put("breakEndTime", wh.breakEndTime)
+                put("startPoint", wh.startPoint)
+                put("endPoint", wh.endPoint)
+                put("startOdometer", wh.startOdometer)
+                put("endOdometer", wh.endOdometer)
             })
         }
     })
@@ -129,27 +156,18 @@ internal fun exportExpenseData(
 
 internal fun exportExpenseCsv(expenses: List<ExpenseItem>): String {
     fun cell(v: String): String = "\"" + (if (v.trimStart().firstOrNull() in listOf('=', '+', '-', '@')) "'" + v else v).replace("\"", "\"\"") + "\""
-    val rows = expenses.map { listOf(it.id.toString(), it.date, it.category, it.amount.toString(), it.time, it.note) }
-    return "\uFEFF" + (listOf(listOf("id", "date", "category", "amount_twd", "time", "note")) + rows).joinToString("\r\n") { it.joinToString(",", transform = ::cell) }
+    val rows = expenses.map { listOf(it.id.toString(), it.date, it.category, yuan(it.amountCents), it.time, it.note, it.paidDate, it.paymentMethod, it.costEndDate) }
+    return "\uFEFF" + (listOf(listOf("id", "date", "category", "amount_twd", "time", "note", "paid_date", "payment_method", "cost_end_date")) + rows).joinToString("\r\n") { it.joinToString(",", transform = ::cell) }
 }
 
 internal fun importExpenseData(text: String): ExpenseBackup {
     val root = JSONObject(text)
-    require(root.optInt("schemaVersion", 1) == 1) { "不支援的資料版本" }
+    require(root.optInt("schemaVersion", 1) in 1..2) { "不支援的資料版本" }
     val expArray = root.optJSONArray("expenses") ?: JSONArray()
     val expList = List(expArray.length()) { expArray.getJSONObject(it).toExpenseItem() }
 
     val planObj = root.optJSONObject("monthlyRentalPlan")
-    val plan = if (planObj != null) {
-        MonthlyRentalPlan(
-            model = planObj.optString("model", ""),
-            periodMonth = planObj.optString("periodMonth", ""),
-            monthlyFee = planObj.optInt("monthlyFee", 0),
-            daysInMonth = planObj.optInt("daysInMonth", 30),
-            dailyCost = planObj.optInt("dailyCost", 0),
-            note = planObj.optString("note", "")
-        )
-    } else MonthlyRentalPlan()
+    val plan = planObj?.toRentalPlan() ?: MonthlyRentalPlan()
 
     val whArray = root.optJSONArray("workHours") ?: JSONArray()
     val whList = List(whArray.length()) { i ->
@@ -159,7 +177,11 @@ internal fun importExpenseData(text: String): ExpenseBackup {
             departureTime = obj.optString("departureTime", ""),
             returnHomeTime = obj.optString("returnHomeTime", ""),
             breakStartTime = obj.optString("breakStartTime", ""),
-            breakEndTime = obj.optString("breakEndTime", "")
+            breakEndTime = obj.optString("breakEndTime", ""),
+            startPoint = obj.optString("startPoint", ""),
+            endPoint = obj.optString("endPoint", ""),
+            startOdometer = obj.optString("startOdometer", ""),
+            endOdometer = obj.optString("endOdometer", "")
         )
     }
     return ExpenseBackup(expList, plan, whList)
@@ -177,6 +199,14 @@ internal fun collectAllWorkHours(prefs: android.content.SharedPreferences): List
             dates.add(key.removePrefix("break_start_time_"))
         } else if (key.startsWith("break_end_time_")) {
             dates.add(key.removePrefix("break_end_time_"))
+        } else if (key.startsWith("day_start_point_")) {
+            dates.add(key.removePrefix("day_start_point_"))
+        } else if (key.startsWith("day_end_point_")) {
+            dates.add(key.removePrefix("day_end_point_"))
+        } else if (key.startsWith("day_start_odometer_")) {
+            dates.add(key.removePrefix("day_start_odometer_"))
+        } else if (key.startsWith("day_end_odometer_")) {
+            dates.add(key.removePrefix("day_end_odometer_"))
         }
     }
     return dates.sorted().mapNotNull { d ->
@@ -184,8 +214,12 @@ internal fun collectAllWorkHours(prefs: android.content.SharedPreferences): List
         val ret = all["return_home_time_$d"]?.toString() ?: ""
         val pauseStart = all["break_start_time_$d"]?.toString() ?: ""
         val pauseEnd = all["break_end_time_$d"]?.toString() ?: ""
-        if (dep.isNotBlank() || ret.isNotBlank() || pauseStart.isNotBlank() || pauseEnd.isNotBlank()) {
-            WorkHourRecord(date = d, departureTime = dep, returnHomeTime = ret, breakStartTime = pauseStart, breakEndTime = pauseEnd)
+        val journey = loadDailyJourney(prefs, d)
+        if (dep.isNotBlank() || ret.isNotBlank() || pauseStart.isNotBlank() || pauseEnd.isNotBlank() ||
+            journey.startPoint.isNotBlank() || journey.endPoint.isNotBlank() || journey.startOdometer.isNotBlank() || journey.endOdometer.isNotBlank()) {
+            WorkHourRecord(date = d, departureTime = dep, returnHomeTime = ret, breakStartTime = pauseStart, breakEndTime = pauseEnd,
+                startPoint = journey.startPoint, endPoint = journey.endPoint,
+                startOdometer = journey.startOdometer, endOdometer = journey.endOdometer)
         } else null
     }
 }
@@ -195,7 +229,9 @@ class ExpenseStore(context: Context) {
 
     fun load(): List<ExpenseItem> = runCatching {
         val array = JSONArray(prefs.getString("items", "[]"))
-        List(array.length()) { i -> array.getJSONObject(i).toExpenseItem() }
+        List(array.length()) { i -> array.getJSONObject(i).toExpenseItem() }.also { migrated ->
+            if ((0 until array.length()).any { !array.getJSONObject(it).has("amountCents") }) save(migrated)
+        }
     }.getOrDefault(emptyList())
 
     fun save(items: List<ExpenseItem>) {
@@ -208,26 +244,12 @@ class ExpenseStore(context: Context) {
         val raw = prefs.getString("monthly_rental_plan", null) ?: return MonthlyRentalPlan()
         return runCatching {
             val json = JSONObject(raw)
-            MonthlyRentalPlan(
-                model = json.optString("model", ""),
-                periodMonth = json.optString("periodMonth", ""),
-                monthlyFee = json.optInt("monthlyFee", 0),
-                daysInMonth = json.optInt("daysInMonth", 30),
-                dailyCost = json.optInt("dailyCost", 0),
-                note = json.optString("note", "")
-            )
+            json.toRentalPlan().also { if (!json.has("feeCents")) saveRentalPlan(it) }
         }.getOrDefault(MonthlyRentalPlan())
     }
 
     fun saveRentalPlan(plan: MonthlyRentalPlan) {
-        val json = JSONObject().apply {
-            put("model", plan.model)
-            put("periodMonth", plan.periodMonth)
-            put("monthlyFee", plan.monthlyFee)
-            put("daysInMonth", plan.daysInMonth)
-            put("dailyCost", plan.dailyCost)
-            put("note", plan.note)
-        }
+        val json = JSONObject(rentalPlanMap(plan))
         prefs.edit().putString("monthly_rental_plan", json.toString()).apply()
     }
 }
@@ -235,6 +257,8 @@ class ExpenseStore(context: Context) {
 @Composable
 internal fun ExpenseScreen(
     rides: List<RideOrder>,
+    onUpdateRides: (List<RideOrder>) -> Unit,
+    onOpenRide: (Long) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -258,6 +282,8 @@ internal fun ExpenseScreen(
     var breakEndTime by remember(selectedDate) {
         mutableStateOf(appearancePrefs.getString("break_end_time_$selectedDate", "") ?: "")
     }
+    var journey by remember(selectedDate) { mutableStateOf(loadDailyJourney(appearancePrefs, selectedDate.toString())) }
+    var journeyRevision by remember { mutableIntStateOf(0) }
     var selectedWeekStart by remember { mutableStateOf(LocalDate.now().with(DayOfWeek.MONDAY).coerceAtLeast(LocalDate.of(2026, 9, 21))) }
 
     var showDepartureDialog by remember { mutableStateOf(false) }
@@ -265,6 +291,8 @@ internal fun ExpenseScreen(
     var showBreakStartDialog by remember { mutableStateOf(false) }
     var showBreakEndDialog by remember { mutableStateOf(false) }
     var showRentalDialog by remember { mutableStateOf(false) }
+    var newRental by remember { mutableStateOf(false) }
+    var editingRentalIndex by remember { mutableStateOf<Int?>(null) }
     var editingExpense by remember { mutableStateOf<ExpenseItem?>(null) }
     var showAddDialog by remember { mutableStateOf(false) }
     var expenseToDelete by remember { mutableStateOf<ExpenseItem?>(null) }
@@ -273,6 +301,7 @@ internal fun ExpenseScreen(
     var showExportImportDialog by remember { mutableStateOf(false) }
     var pendingExpenseImport by remember { mutableStateOf<ExpenseBackup?>(null) }
     var chartMode by remember { mutableIntStateOf(0) } // 0: 每日收支圖表, 1: 時數效益圖表
+    var showWeeklyDetails by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         FirebaseSyncManager.onRemoteExpensesUpdated = { remoteExp, deletedIds ->
@@ -303,6 +332,10 @@ internal fun ExpenseScreen(
                 breakStartTime = pauseStart
                 breakEndTime = pauseEnd
             }
+        }
+        FirebaseSyncManager.onRemoteDailyJourneyUpdated = { date, updated ->
+            journeyRevision++
+            if (date == selectedDate.toString()) journey = updated
         }
         FirebaseSyncManager.onRemoteRentalPlanUpdated = { remotePlan ->
             rentalPlan = remotePlan
@@ -347,26 +380,24 @@ internal fun ExpenseScreen(
     }
 
     val dateStr = selectedDate.toString()
-    val todayExpenses = expenses.filter { it.date == dateStr }
+    val dailyDistanceKm = remember(selectedDate, journey, journeyRevision) {
+        effectiveDailyJourney(selectedDate) { day -> loadDailyJourney(appearancePrefs, day.toString()) }.distanceKm()
+    }
+    val todayExpenses = expenses.filter { it.costCentsOn(selectedDate) > 0 }
 
     // 當日租車成本（包含月租車分攤的每日成本 + 當日手動單項租車費用）
-    val monthStr = selectedDate.format(DateTimeFormatter.ofPattern("yyyy-MM"))
-    val dailyRentalAmortized = if (rentalPlan.monthlyFee > 0 && (rentalPlan.periodMonth.isBlank() || rentalPlan.periodMonth == monthStr)) {
-        rentalPlan.dailyCost
-    } else 0
+    val dailyRentalAmortized = rentalPlan.totalCostCentsOn(selectedDate)
 
-    val gasCost = todayExpenses.filter { it.category == "加油" }.sumOf { it.amount }
-    val parkingCost = todayExpenses.filter { it.category == "停車費" }.sumOf { it.amount }
-    val manualRentalCost = todayExpenses.filter { it.category == "租車費用" }.sumOf { it.amount }
+    val gasCost = todayExpenses.filter { it.category == "加油" }.sumOf { it.costCentsOn(selectedDate) }
+    val parkingCost = todayExpenses.filter { it.category == "停車費" }.sumOf { it.costCentsOn(selectedDate) }
+    val manualRentalCost = todayExpenses.filter { it.category == "租車費用" }.sumOf { it.costCentsOn(selectedDate) }
     val rentalCost = dailyRentalAmortized + manualRentalCost
-    val otherCost = todayExpenses.filter { it.category == "其他" }.sumOf { it.amount }
+    val otherCost = todayExpenses.filter { it.category == "其他" }.sumOf { it.costCentsOn(selectedDate) }
     val totalCost = gasCost + parkingCost + rentalCost + otherCost
 
-    // 今日載客營收（完成行程實收 + 小費）
+    // 今日載客營收（完成行程實收、小費及月結）
     val dayCompletedRides = rides.filter { it.serviceDate == dateStr && it.completed }
-    val todayRevenue = dayCompletedRides.fold(0) { acc, ride ->
-        acc + (ride.received.toDoubleOrNull()?.toInt() ?: 0) + (ride.tip.toDoubleOrNull()?.toInt() ?: 0)
-    }
+    val todayRevenue = dayCompletedRides.sumOf(::rideOperatingRevenue)
 
     // 當日工作時間計算 (分鐘)
     val workDurationMins = netWorkMinutes(departureTime, returnHomeTime, breakStartTime, breakEndTime)
@@ -383,31 +414,25 @@ internal fun ExpenseScreen(
     val endOfWeek = startOfWeek.plusDays(6)
     val weekDates = (0..6).map { startOfWeek.plusDays(it.toLong()) }
 
-    // 本週營收 (實收 + 小費)
+    // 本週營收與今日採同一計算方式
     val weekCompletedRides = rides.filter { ride ->
         ride.completed && runCatching {
             val d = LocalDate.parse(ride.serviceDate)
             d in startOfWeek..endOfWeek
         }.getOrDefault(false)
     }
-    val weekRevenue = weekCompletedRides.fold(0) { acc, r ->
-        acc + (r.received.toDoubleOrNull()?.toInt() ?: 0) + (r.tip.toDoubleOrNull()?.toInt() ?: 0)
-    }
+    val weekRevenue = weekCompletedRides.sumOf(::rideOperatingRevenue)
 
     // 本週各類別花費與總支出
-    val weekItems = expenses.filter { item ->
-        runCatching {
-            val d = LocalDate.parse(item.date)
-            d in startOfWeek..endOfWeek
-        }.getOrDefault(false)
-    }
-    val weekGas = weekItems.filter { it.category == "加油" }.sumOf { it.amount }
-    val weekParking = weekItems.filter { it.category == "停車費" }.sumOf { it.amount }
-    val weekOther = weekItems.filter { it.category == "其他" }.sumOf { it.amount }
-    val weekManualRental = weekItems.filter { it.category == "租車費用" }.sumOf { it.amount }
+    val weekItems = expenses.filter { item -> weekDates.any { item.costCentsOn(it) > 0 } }
+    val weekGas = weekItems.filter { it.category == "加油" }.sumOf { item -> weekDates.sumOf { item.costCentsOn(it) } }
+    val weekParking = weekItems.filter { it.category == "停車費" }.sumOf { item -> weekDates.sumOf { item.costCentsOn(it) } }
+    val weekOther = weekItems.filter { it.category == "其他" }.sumOf { item -> weekDates.sumOf { item.costCentsOn(it) } }
+    val weekManualRental = weekItems.filter { it.category == "租車費用" }.sumOf { item -> weekDates.sumOf { item.costCentsOn(it) } }
+
     // 本週 7 天的每日月租分攤成本
     val weekRentalAmortized = weekDates.sumOf { day ->
-        if (rentalPlan.monthlyFee > 0 && (rentalPlan.periodMonth.isBlank() || rentalPlan.periodMonth == day.format(DateTimeFormatter.ofPattern("yyyy-MM")))) rentalPlan.dailyCost else 0
+        rentalPlan.totalCostCentsOn(day)
     }
     val weekRentalTotal = weekRentalAmortized + weekManualRental
     val weekTotalCost = weekGas + weekParking + weekRentalTotal + weekOther
@@ -430,12 +455,10 @@ internal fun ExpenseScreen(
             val dayRides = rides.filter { it.serviceDate == dayDStr }
             val sortedDayRides = dayRides.sortedBy { minuteOfDay(it.pickupTime) ?: Int.MAX_VALUE }
             val dayCompleted = sortedDayRides.filter { it.completed }
-            val dRev = dayCompleted.fold(0) { acc, r ->
-                acc + (r.received.toDoubleOrNull()?.toInt() ?: 0) + (r.tip.toDoubleOrNull()?.toInt() ?: 0)
-            }
+            val dRev = dayCompleted.sumOf(::rideOperatingRevenue)
 
-            val dManualExp = expenses.filter { it.date == dayDStr }.sumOf { it.amount }
-            val dRental = if (rentalPlan.monthlyFee > 0 && (rentalPlan.periodMonth.isBlank() || rentalPlan.periodMonth == dayDate.format(DateTimeFormatter.ofPattern("yyyy-MM")))) rentalPlan.dailyCost else 0
+            val dManualExp = expenses.sumOf { it.costCentsOn(dayDate) }
+            val dRental = rentalPlan.totalCostCentsOn(dayDate)
             val dExp = dManualExp + dRental
             val dNet = dRev - dExp
 
@@ -466,17 +489,11 @@ internal fun ExpenseScreen(
 
     val weekTotalTripMins = weekDailyStats.sumOf { it.tripDurationMins }
     val weekEfficiencyRate = if (weekWorkDurationMins > 0) ((weekTotalTripMins.toDouble() / weekWorkDurationMins) * 100).toInt() else 0
-    val weekHourlyNet = if (weekWorkDurationMins > 0) (weekNetIncome / (weekWorkDurationMins / 60.0)).toInt() else null
-    val weekTripHourlyRev = if (weekTotalTripMins > 0) (weekRevenue / (weekTotalTripMins / 60.0)).toInt() else null
+    val weekHourlyNet = if (weekWorkDurationMins > 0) hourlyYuan(weekNetIncome, weekWorkDurationMins) else null
+    val weekTripHourlyRev = if (weekTotalTripMins > 0) hourlyYuan(weekRevenue, weekTotalTripMins) else null
 
     Scaffold(
-        floatingActionButton = {
-            ExtendedFloatingActionButton(
-                onClick = { showAddDialog = true },
-                icon = { Icon(Icons.Default.Add, contentDescription = "新增") },
-                text = { Text("記一筆花費") }
-            )
-        }
+        contentWindowInsets = WindowInsets(0, 0, 0, 0)
     ) { padding ->
         LazyColumn(
             modifier = modifier
@@ -484,17 +501,17 @@ internal fun ExpenseScreen(
                 .padding(padding)
                 .padding(horizontal = 14.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
-            contentPadding = PaddingValues(top = 10.dp, bottom = 80.dp)
+            contentPadding = PaddingValues(bottom = 24.dp)
         ) {
             // 0. 頂端標題與匯出/匯入按鈕
             item {
                 Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Text(
-                        "營業花費與工時統計",
+                        "營業收支與工時統計",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
                     )
@@ -516,315 +533,28 @@ internal fun ExpenseScreen(
                     modifier = Modifier.fillMaxWidth(),
                     colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
                 ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        TextButton(onClick = { selectedDate = selectedDate.minusDays(1) }) {
-                            Text("◀ 前一天")
-                        }
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = "${selectedDate.format(DateTimeFormatter.ofPattern("yyyy/MM/dd"))} (${formatWeekday(selectedDate)})",
-                                style = MaterialTheme.typography.titleMedium,
-                                fontWeight = FontWeight.Bold
-                            )
-                            if (selectedDate == LocalDate.now()) {
-                                Text(
-                                    text = "今天",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                            }
-                        }
-                        TextButton(onClick = { selectedDate = selectedDate.plusDays(1) }) {
-                            Text("後一天 ▶")
-                        }
-                    }
+                    DayNavigation(selectedDate, onSelect = { selectedDate = it }, calendarEnabled = true,
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp))
                 }
             }
 
-            // 2. 工作時間卡片 (精簡緊湊設計，無需提示說明)
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
-                ) {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Icon(Icons.Default.Schedule, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
-                                Text("今日工作時間", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
-                            }
-                            if (workDurationMins != null) {
-                                val hrs = workDurationMins / 60
-                                val mins = workDurationMins % 60
-                                Surface(
-                                    color = MaterialTheme.colorScheme.primaryContainer,
-                                    shape = RoundedCornerShape(6.dp)
-                                ) {
-                                    Text(
-                                        text = "${hrs} 小時 ${mins} 分",
-                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
-                                        style = MaterialTheme.typography.labelMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onPrimaryContainer
-                                    )
-                                }
-                            }
-                        }
-
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            // 當日出門時間按鈕
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (departureTime.isNotBlank()) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
-                                border = BorderStroke(1.dp, if (departureTime.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable { showDepartureDialog = true }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text("🚗 出門", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text(
-                                        text = departureTime.ifBlank { "點此設定" },
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (departureTime.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
-                                    )
-                                }
-                            }
-
-                            // 當日回家時間按鈕
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
-                                border = BorderStroke(1.dp, if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant),
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clickable { showReturnHomeDialog = true }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text("🏠 回家", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                    Text(
-                                        text = returnHomeTime.ifBlank { "點此設定" },
-                                        style = MaterialTheme.typography.titleSmall,
-                                        fontWeight = FontWeight.SemiBold,
-                                        color = if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
-                                    )
-                                }
-                            }
-                        }
-                        Text("工時＝出門至回家－休息時間；休息起訖都設定後才扣除。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        val deductedMins = (netWorkMinutes(departureTime, returnHomeTime) ?: 0) - (workDurationMins ?: 0)
-                        if (deductedMins > 0) {
-                            Text("已扣除休息 ${deductedMins / 60} 小時 ${deductedMins % 60} 分", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
-                        }
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(onClick = { showBreakStartDialog = true }, modifier = Modifier.weight(1f)) {
-                                Text("休息開始 ${breakStartTime.ifBlank { "設定" }}")
-                            }
-                            OutlinedButton(onClick = { showBreakEndDialog = true }, modifier = Modifier.weight(1f)) {
-                                Text("休息結束 ${breakEndTime.ifBlank { "設定" }}")
-                            }
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FinanceSections(selectedDate, rides, expenses, rentalPlan, onUpdateRides, onOpenRide)
+                    OutlinedButton(onClick = { newRental = true; editingRentalIndex = null; showRentalDialog = true }) { Text("新增租車合約") }
+                    rentalPlan.archivedPlans.forEachIndexed { index, plan ->
+                        TextButton(onClick = { newRental = false; editingRentalIndex = index; showRentalDialog = true }) {
+                            Text("租約 ${plan.startDate}～${plan.endDate} · ${plan.model} · ${yuan(plan.feeCents)} 元")
                         }
                     }
                 }
             }
 
-            // 3. 營業成本總覽（點擊租車 icon 開啟月租試算 popup）
-            item {
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f))
-                ) {
-                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text("營業成本總覽", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                            Text("今日總成本：$totalCost 元", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error)
-                        }
-
-                        // 各類別成本細目（點擊租車可設定月租換算）
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            CostPill(icon = Icons.Default.LocalGasStation, label = "加油", amount = gasCost, tint = Color(0xFFE65100))
-                            CostPill(icon = Icons.Default.LocalParking, label = "停車", amount = parkingCost, tint = Color(0xFF1976D2))
-                            // 租車按鈕可點擊跳出月租設定 popup
-                            CostPill(
-                                icon = Icons.Default.DirectionsCar,
-                                label = "租車(點擊)",
-                                amount = rentalCost,
-                                tint = Color(0xFF7B1FA2),
-                                isClickable = true,
-                                onClick = { showRentalDialog = true }
-                            )
-                            CostPill(icon = Icons.Default.Receipt, label = "其他", amount = otherCost, tint = Color(0xFF5D4037))
-                        }
-
-                        // 月租車設定狀態橫條
-                        if (rentalPlan.monthlyFee > 0) {
-                            Surface(
-                                shape = RoundedCornerShape(6.dp),
-                                color = MaterialTheme.colorScheme.surface,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clickable { showRentalDialog = true }
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                        Icon(Icons.Default.DirectionsCar, contentDescription = null, tint = Color(0xFF7B1FA2), modifier = Modifier.size(16.dp))
-                                        Text(
-                                            text = "月租車：${rentalPlan.model.ifBlank { "車輛" }} · 月費 ${rentalPlan.monthlyFee} 元",
-                                            style = MaterialTheme.typography.labelSmall
-                                        )
-                                    }
-                                    Text(
-                                        text = "日分攤 ${rentalPlan.dailyCost} 元/天 ⚙️",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontWeight = FontWeight.Bold,
-                                        color = Color(0xFF7B1FA2)
-                                    )
-                                }
-                            }
-                        }
-
-                        HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
-
-                        // 今日營收與淨收益
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween
-                        ) {
-                            Column {
-                                Text("今日載客營收", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text("$todayRevenue 元", style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
-                            }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Text("今日淨收入", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                Text(
-                                    text = "$netIncome 元",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    fontWeight = FontWeight.Bold,
-                                    color = if (netIncome >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
-                                )
-                            }
-                            Column(horizontalAlignment = Alignment.End) {
-                                Text("平均時薪", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                                val hourlyNet = if (workDurationMins != null && workDurationMins > 0) {
-                                    (netIncome / (workDurationMins / 60.0)).toInt()
-                                } else null
-                                Text(
-                                    text = hourlyNet?.let { "$it 元/時" } ?: "--",
-                                    style = MaterialTheme.typography.bodyLarge,
-                                    fontWeight = FontWeight.SemiBold
-                                )
-                            }
-                        }
-                    }
-                }
-            }
-
-            // 4. 當日花費明細標題
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        "當日花費明細 (${todayExpenses.size} 筆)",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-
-            // 5. 花費列表
-            if (todayExpenses.isEmpty()) {
-                item {
-                    Surface(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 8.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f)
-                    ) {
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 24.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally,
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            Icon(
-                                Icons.Default.Receipt,
-                                contentDescription = null,
-                                modifier = Modifier.size(32.dp),
-                                tint = MaterialTheme.colorScheme.outline
-                            )
-                            Text(
-                                "今日尚無手動花費記錄",
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Button(
-                                onClick = { showAddDialog = true },
-                                modifier = Modifier.padding(top = 4.dp)
-                            ) {
-                                Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(16.dp))
-                                Spacer(Modifier.width(4.dp))
-                                Text("記一筆花費")
-                            }
-                        }
-                    }
-                }
-            } else {
-                items(todayExpenses, key = { it.id }) { item ->
-                    ExpenseItemCard(
-                        item = item,
-                        onEdit = { editingExpense = item },
-                        onDelete = { expenseToDelete = item }
-                    )
-                }
-            }
-
-            // 6. 每週營運總結（視覺化圖表與工作效益分析）
+            // 2. 週統計
             item {
                 Card(
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(top = 10.dp),
+                        .fillMaxWidth(),
                     colors = CardDefaults.cardColors(
                         containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
                     ),
@@ -835,11 +565,7 @@ internal fun ExpenseScreen(
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         // 頂部週期間標題
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 Icon(
                                     Icons.Default.DateRange,
@@ -847,14 +573,8 @@ internal fun ExpenseScreen(
                                     tint = MaterialTheme.colorScheme.primary,
                                     modifier = Modifier.size(20.dp)
                                 )
-                                Text("每週營運總結", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                                Text("週統計", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                             }
-                            Text(
-                                text = "${startOfWeek.format(DateTimeFormatter.ofPattern("MM/dd"))} ~ ${endOfWeek.format(DateTimeFormatter.ofPattern("MM/dd"))}",
-                                style = MaterialTheme.typography.labelMedium,
-                                fontWeight = FontWeight.Bold,
-                                color = MaterialTheme.colorScheme.primary
-                            )
                         }
 
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -882,7 +602,7 @@ internal fun ExpenseScreen(
                                 }
                                 Spacer(Modifier.height(2.dp))
                                 Text(
-                                    text = "$weekRevenue 元",
+                                    text = "${yuan(weekRevenue)} 元",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = Color(0xFF2E7D32)
@@ -894,11 +614,11 @@ internal fun ExpenseScreen(
                             Column(modifier = Modifier.weight(1f)) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Icon(Icons.AutoMirrored.Filled.ReceiptLong, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
-                                    Text("本週總支出", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("本週總成本", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Spacer(Modifier.height(2.dp))
                                 Text(
-                                    text = "$weekTotalCost 元",
+                                    text = "${yuan(weekTotalCost)} 元",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.Bold,
                                     color = MaterialTheme.colorScheme.error
@@ -910,11 +630,11 @@ internal fun ExpenseScreen(
                             Column(modifier = Modifier.weight(1f), horizontalAlignment = Alignment.End) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Icon(Icons.AutoMirrored.Filled.TrendingUp, contentDescription = null, tint = if (weekNetIncome >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error, modifier = Modifier.size(16.dp))
-                                    Text("本週淨收益", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text("本週營運淨額", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                                 }
                                 Spacer(Modifier.height(2.dp))
                                 Text(
-                                    text = "$weekNetIncome 元",
+                                    text = "${yuan(weekNetIncome)} 元",
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.ExtraBold,
                                     color = if (weekNetIncome >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
@@ -927,6 +647,14 @@ internal fun ExpenseScreen(
                             }
                         }
 
+                        TextButton(
+                            onClick = { showWeeklyDetails = !showWeeklyDetails },
+                            modifier = Modifier.align(Alignment.End)
+                        ) {
+                            Text(if (showWeeklyDetails) "收起圖表與明細 ▲" else "展開圖表與明細 ▼")
+                        }
+
+                        if (showWeeklyDetails) {
                         // 本週各類別花費明細標籤列
                         Surface(
                             shape = RoundedCornerShape(8.dp),
@@ -941,19 +669,19 @@ internal fun ExpenseScreen(
                             ) {
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                     Icon(Icons.Default.LocalGasStation, contentDescription = null, tint = Color(0xFFE65100), modifier = Modifier.size(14.dp))
-                                    Text("油錢 $weekGas", style = MaterialTheme.typography.labelSmall)
+                                    Text("油錢 ${yuan(weekGas)}", style = MaterialTheme.typography.labelSmall)
                                 }
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                     Icon(Icons.Default.LocalParking, contentDescription = null, tint = Color(0xFF1976D2), modifier = Modifier.size(14.dp))
-                                    Text("停車 $weekParking", style = MaterialTheme.typography.labelSmall)
+                                    Text("停車 ${yuan(weekParking)}", style = MaterialTheme.typography.labelSmall)
                                 }
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                     Icon(Icons.Default.DirectionsCar, contentDescription = null, tint = Color(0xFF7B1FA2), modifier = Modifier.size(14.dp))
-                                    Text("租車 $weekRentalTotal", style = MaterialTheme.typography.labelSmall)
+                                    Text("租車 ${yuan(weekRentalTotal)}", style = MaterialTheme.typography.labelSmall)
                                 }
                                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(3.dp)) {
                                     Icon(Icons.Default.Receipt, contentDescription = null, tint = Color(0xFF5D4037), modifier = Modifier.size(14.dp))
-                                    Text("其他 $weekOther", style = MaterialTheme.typography.labelSmall)
+                                    Text("其他 ${yuan(weekOther)}", style = MaterialTheme.typography.labelSmall)
                                 }
                             }
                         }
@@ -1024,7 +752,7 @@ internal fun ExpenseScreen(
                                             text = weekHourlyNet?.let { "$$it / hr" } ?: "-",
                                             style = MaterialTheme.typography.bodyMedium,
                                             fontWeight = FontWeight.Bold,
-                                            color = if ((weekHourlyNet ?: 0) >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+                                            color = if (weekNetIncome >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
                                         )
                                         if (weekTripHourlyRev != null) {
                                             Text(
@@ -1189,7 +917,7 @@ internal fun ExpenseScreen(
                                         horizontalArrangement = Arrangement.SpaceBetween
                                     ) {
                                         Text(
-                                            text = "收支：收入 ${selStat.revenue} - 支出 ${selStat.expense} = ${if (selStat.netProfit >= 0) "+${selStat.netProfit}" else "${selStat.netProfit}"} 元",
+                                            text = "收支：收入 ${yuan(selStat.revenue)} - 支出 ${yuan(selStat.expense)} = ${if (selStat.netProfit >= 0) "+${yuan(selStat.netProfit)}" else "${yuan(selStat.netProfit)}"} 元",
                                             style = MaterialTheme.typography.bodySmall,
                                             color = if (selStat.netProfit >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error,
                                             fontWeight = FontWeight.SemiBold
@@ -1212,9 +940,295 @@ internal fun ExpenseScreen(
                                 }
                             }
                         }
+                        }
                     }
                 }
             }
+
+            item {
+                Text("日統計", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+            }
+
+            // 3. 今日工作時間
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 1.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Icon(Icons.Default.Schedule, contentDescription = null, tint = MaterialTheme.colorScheme.primary, modifier = Modifier.size(18.dp))
+                                Text("今日工作時間", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                            }
+                            if (workDurationMins != null) {
+                                val hrs = workDurationMins / 60
+                                val mins = workDurationMins % 60
+                                Surface(
+                                    color = MaterialTheme.colorScheme.primaryContainer,
+                                    shape = RoundedCornerShape(6.dp)
+                                ) {
+                                    Text(
+                                        text = "${hrs} 小時 ${mins} 分",
+                                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer
+                                    )
+                                }
+                            }
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            // 當日出門時間按鈕
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (departureTime.isNotBlank()) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
+                                border = BorderStroke(1.dp, if (departureTime.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { showDepartureDialog = true }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("🚗 出門", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(
+                                        text = departureTime.ifBlank { "點此設定" },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (departureTime.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                                    )
+                                }
+                            }
+
+                            // 當日回家時間按鈕
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.2f),
+                                border = BorderStroke(1.dp, if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { showReturnHomeDialog = true }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Text("🏠 回家", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    Text(
+                                        text = returnHomeTime.ifBlank { "點此設定" },
+                                        style = MaterialTheme.typography.titleSmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = if (returnHomeTime.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                                    )
+                                }
+                            }
+                        }
+                        Text("工時＝出門至回家－休息時間；休息起訖都設定後才扣除。", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        val deductedMins = (netWorkMinutes(departureTime, returnHomeTime) ?: 0) - (workDurationMins ?: 0)
+                        if (deductedMins > 0) {
+                            Text("已扣除休息 ${deductedMins / 60} 小時 ${deductedMins % 60} 分", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
+                        }
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(onClick = { showBreakStartDialog = true }, modifier = Modifier.weight(1f)) {
+                                Text("休息開始 ${breakStartTime.ifBlank { "設定" }}")
+                            }
+                            OutlinedButton(onClick = { showBreakEndDialog = true }, modifier = Modifier.weight(1f)) {
+                                Text("休息結束 ${breakEndTime.ifBlank { "設定" }}")
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 3. 營業成本總覽（點擊租車 icon 開啟月租試算 popup）
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.35f))
+                ) {
+                    Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("今日收支與成本", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                            Text("今日總成本：${yuan(totalCost)} 元", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.ExtraBold, color = MaterialTheme.colorScheme.error)
+                        }
+
+                        // 各類別成本細目（點擊租車可設定月租換算）
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            CostPill(icon = Icons.Default.LocalGasStation, label = "加油", amount = gasCost, tint = Color(0xFFE65100))
+                            CostPill(icon = Icons.Default.LocalParking, label = "停車", amount = parkingCost, tint = Color(0xFF1976D2))
+                            // 租車按鈕可點擊跳出月租設定 popup
+                            CostPill(
+                                icon = Icons.Default.DirectionsCar,
+                                label = "租車(點擊)",
+                                amount = rentalCost,
+                                tint = Color(0xFF7B1FA2),
+                                isClickable = true,
+                                onClick = { showRentalDialog = true }
+                            )
+                            CostPill(icon = Icons.Default.Receipt, label = "其他", amount = otherCost, tint = Color(0xFF5D4037))
+                        }
+
+                        // 月租車設定狀態橫條
+                        if (rentalPlan.feeCents > 0) {
+                            Surface(
+                                shape = RoundedCornerShape(6.dp),
+                                color = MaterialTheme.colorScheme.surface,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable { showRentalDialog = true }
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                        Icon(Icons.Default.DirectionsCar, contentDescription = null, tint = Color(0xFF7B1FA2), modifier = Modifier.size(16.dp))
+                                        Text(
+                                            text = "租車：${rentalPlan.model.ifBlank { "車輛" }} · ${rentalPlan.startDate.ifBlank { rentalPlan.periodMonth }}～${rentalPlan.endDate.ifBlank { rentalPlan.periodMonth }} · 總費 ${yuan(rentalPlan.feeCents)} 元",
+                                            style = MaterialTheme.typography.labelSmall
+                                        )
+                                    }
+                                    Text(
+                                        text = "日分攤 ${yuan(rentalPlan.dailyCostCents)} 元/天 ⚙️",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color(0xFF7B1FA2)
+                                    )
+                                }
+                            }
+                        }
+
+                        HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+
+                        // 今日營收、淨收入、時薪與里程
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("今日載客營收", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text("${yuan(todayRevenue)} 元", style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            }
+                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("營運淨額", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(
+                                    text = "${yuan(netIncome)} 元",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (netIncome >= 0) Color(0xFF2E7D32) else MaterialTheme.colorScheme.error
+                                )
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("平均時薪", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                val hourlyNet = if (workDurationMins != null && workDurationMins > 0) {
+                                    hourlyYuan(netIncome, workDurationMins)
+                                } else null
+                                Text(
+                                    text = hourlyNet?.let { "$it 元/時" } ?: "--",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                            }
+                            Column(Modifier.weight(1f), horizontalAlignment = Alignment.CenterHorizontally) {
+                                Text("今日里程", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                Text(dailyDistanceKm?.let { "$it km" } ?: "--",
+                                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 5. 新增花費項目與當日明細
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        "花費項目 (${todayExpenses.size} 筆)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Button(onClick = { showAddDialog = true }) {
+                        Icon(Icons.Default.Add, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("新增花費項目")
+                    }
+                }
+            }
+
+            // 6. 當日花費列表
+            if (todayExpenses.isEmpty()) {
+                item {
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 8.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f)
+                    ) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 24.dp),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.Receipt,
+                                contentDescription = null,
+                                modifier = Modifier.size(32.dp),
+                                tint = MaterialTheme.colorScheme.outline
+                            )
+                            Text(
+                                "今日尚無手動花費記錄",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
+            } else {
+                items(todayExpenses, key = { it.id }) { item ->
+                    ExpenseItemCard(
+                        item = item,
+                        onEdit = { editingExpense = item },
+                        onDelete = { expenseToDelete = item }
+                    )
+                }
+            }
+
+
         }
     }
 
@@ -1306,20 +1320,26 @@ internal fun ExpenseScreen(
     // 租車月租設定與每日成本換算 Dialog
     if (showRentalDialog) {
         RentalPlanDialog(
-            initial = rentalPlan,
+            initial = if (newRental) MonthlyRentalPlan() else editingRentalIndex?.let { rentalPlan.archivedPlans[it] } ?: rentalPlan,
             currentMonth = selectedDate.format(DateTimeFormatter.ofPattern("yyyy-MM")),
-            daysInCurrentMonth = selectedDate.lengthOfMonth(),
-            onDismiss = { showRentalDialog = false },
+            onDismiss = { showRentalDialog = false; newRental = false; editingRentalIndex = null },
             onSave = { updated ->
-                rentalPlan = updated
-                store.saveRentalPlan(updated)
-                FirebaseSyncManager.uploadRentalPlan(updated)
+                val saved = if (newRental) updated.copy(archivedPlans = rentalPlan.allPlans().filter { it.feeCents > 0 })
+                    else if (editingRentalIndex != null) rentalPlan.copy(archivedPlans = rentalPlan.archivedPlans.mapIndexed { i, plan -> if (i == editingRentalIndex) updated else plan })
+                    else updated.copy(archivedPlans = rentalPlan.archivedPlans)
+                rentalPlan = saved
+                store.saveRentalPlan(saved)
+                FirebaseSyncManager.uploadRentalPlan(saved)
+                newRental = false; editingRentalIndex = null
                 showRentalDialog = false
             },
             onClear = {
-                rentalPlan = MonthlyRentalPlan()
-                store.saveRentalPlan(MonthlyRentalPlan())
-                FirebaseSyncManager.uploadRentalPlan(MonthlyRentalPlan())
+                val saved = if (editingRentalIndex != null) rentalPlan.copy(archivedPlans = rentalPlan.archivedPlans.filterIndexed { i, _ -> i != editingRentalIndex })
+                    else MonthlyRentalPlan(archivedPlans = rentalPlan.archivedPlans)
+                rentalPlan = saved
+                store.saveRentalPlan(saved)
+                FirebaseSyncManager.uploadRentalPlan(saved)
+                newRental = false; editingRentalIndex = null
                 showRentalDialog = false
             }
         )
@@ -1332,7 +1352,7 @@ internal fun ExpenseScreen(
             initial = ExpenseItem(
                 date = dateStr,
                 category = "加油",
-                amount = 0,
+                amountCents = 0,
                 time = LocalTime.now().format(DateTimeFormatter.ofPattern("HH:mm"))
             ),
             onDismiss = { showAddDialog = false },
@@ -1363,7 +1383,7 @@ internal fun ExpenseScreen(
         AlertDialog(
             onDismissRequest = { expenseToDelete = null },
             title = { Text("刪除花費記錄？") },
-            text = { Text("確定要刪除「${target.category} ${target.amount} 元」這筆記錄嗎？") },
+            text = { Text("確定要刪除「${target.category} ${yuan(target.amountCents)} 元」這筆記錄嗎？\n對應的成本與付款紀錄也會移除。") },
             confirmButton = {
                 TextButton(
                     onClick = {
@@ -1453,8 +1473,8 @@ internal fun ExpenseScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     Text("檔案包含：")
                     Text("• 花費記錄：${incoming.expenses.size} 筆（ID 重複衝突 $conflicts 筆）")
-                    if (incoming.rentalPlan.monthlyFee > 0) {
-                        Text("• 月租車設定：${incoming.rentalPlan.model}（月租 ${incoming.rentalPlan.monthlyFee} 元）")
+                    if (incoming.rentalPlan.feeCents > 0) {
+                        Text("• 月租車設定：${incoming.rentalPlan.model}（月租 ${yuan(incoming.rentalPlan.feeCents)} 元）")
                     }
                     if (incoming.workHours.isNotEmpty()) {
                         Text("• 每日出門/回家工時：${incoming.workHours.size} 天")
@@ -1466,7 +1486,7 @@ internal fun ExpenseScreen(
                 TextButton(onClick = {
                     val merged = expenses.filterNot { old -> incoming.expenses.any { it.id == old.id } } + incoming.expenses
                     saveExpenses(merged)
-                    if (incoming.rentalPlan.monthlyFee > 0 || incoming.rentalPlan.model.isNotBlank()) {
+                    if (incoming.rentalPlan.feeCents > 0 || incoming.rentalPlan.model.isNotBlank()) {
                         rentalPlan = incoming.rentalPlan
                         store.saveRentalPlan(incoming.rentalPlan)
                     }
@@ -1476,8 +1496,14 @@ internal fun ExpenseScreen(
                         if (wh.returnHomeTime.isNotBlank()) editor.putString("return_home_time_${wh.date}", wh.returnHomeTime)
                         if (wh.breakStartTime.isNotBlank()) editor.putString("break_start_time_${wh.date}", wh.breakStartTime)
                         if (wh.breakEndTime.isNotBlank()) editor.putString("break_end_time_${wh.date}", wh.breakEndTime)
+                        if (wh.startPoint.isNotBlank()) editor.putString("day_start_point_${wh.date}", wh.startPoint)
+                        if (wh.endPoint.isNotBlank()) editor.putString("day_end_point_${wh.date}", wh.endPoint)
+                        if (wh.startOdometer.isNotBlank()) editor.putString("day_start_odometer_${wh.date}", wh.startOdometer)
+                        if (wh.endOdometer.isNotBlank()) editor.putString("day_end_odometer_${wh.date}", wh.endOdometer)
                     }
                     editor.apply()
+                    journey = loadDailyJourney(appearancePrefs, selectedDate.toString())
+                    journeyRevision++
                     departureTime = appearancePrefs.getString("departure_time_$selectedDate", "") ?: ""
                     returnHomeTime = appearancePrefs.getString("return_home_time_$selectedDate", "") ?: ""
                     breakStartTime = appearancePrefs.getString("break_start_time_$selectedDate", "") ?: ""
@@ -1492,7 +1518,7 @@ internal fun ExpenseScreen(
                 TextButton(onClick = {
                     val merged = expenses + incoming.expenses.filterNot { it.id in existingIds }
                     saveExpenses(merged)
-                    if (rentalPlan.monthlyFee == 0 && incoming.rentalPlan.monthlyFee > 0) {
+                    if (rentalPlan.feeCents == 0L && incoming.rentalPlan.feeCents > 0) {
                         rentalPlan = incoming.rentalPlan
                         store.saveRentalPlan(incoming.rentalPlan)
                     }
@@ -1510,8 +1536,22 @@ internal fun ExpenseScreen(
                         if (!appearancePrefs.contains("break_end_time_${wh.date}") && wh.breakEndTime.isNotBlank()) {
                             editor.putString("break_end_time_${wh.date}", wh.breakEndTime)
                         }
+                        if (!appearancePrefs.contains("day_start_point_${wh.date}") && wh.startPoint.isNotBlank()) {
+                            editor.putString("day_start_point_${wh.date}", wh.startPoint)
+                        }
+                        if (!appearancePrefs.contains("day_end_point_${wh.date}") && wh.endPoint.isNotBlank()) {
+                            editor.putString("day_end_point_${wh.date}", wh.endPoint)
+                        }
+                        if (!appearancePrefs.contains("day_start_odometer_${wh.date}") && wh.startOdometer.isNotBlank()) {
+                            editor.putString("day_start_odometer_${wh.date}", wh.startOdometer)
+                        }
+                        if (!appearancePrefs.contains("day_end_odometer_${wh.date}") && wh.endOdometer.isNotBlank()) {
+                            editor.putString("day_end_odometer_${wh.date}", wh.endOdometer)
+                        }
                     }
                     editor.apply()
+                    journey = loadDailyJourney(appearancePrefs, selectedDate.toString())
+                    journeyRevision++
                     departureTime = appearancePrefs.getString("departure_time_$selectedDate", "") ?: ""
                     returnHomeTime = appearancePrefs.getString("return_home_time_$selectedDate", "") ?: ""
                     breakStartTime = appearancePrefs.getString("break_start_time_$selectedDate", "") ?: ""
@@ -1539,7 +1579,7 @@ internal fun ExpenseScreen(
 private fun CostPill(
     icon: androidx.compose.ui.graphics.vector.ImageVector,
     label: String,
-    amount: Int,
+    amount: Long,
     tint: Color,
     isClickable: Boolean = false,
     onClick: () -> Unit = {}
@@ -1554,7 +1594,7 @@ private fun CostPill(
             Text(label, style = MaterialTheme.typography.labelSmall, color = if (isClickable) tint else MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Text(
-            text = "$amount",
+            text = "${yuan(amount)}",
             style = MaterialTheme.typography.bodyMedium,
             fontWeight = FontWeight.Bold,
             color = if (isClickable) tint else MaterialTheme.colorScheme.onSurface
@@ -1621,7 +1661,7 @@ private fun ExpenseItemCard(
 
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
-                    text = "${item.amount} 元",
+                    text = "${yuan(item.amountCents)} 元",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.ExtraBold,
                     color = MaterialTheme.colorScheme.error
@@ -1646,35 +1686,39 @@ private fun ExpenseItemCard(
 private fun RentalPlanDialog(
     initial: MonthlyRentalPlan,
     currentMonth: String,
-    daysInCurrentMonth: Int,
     onDismiss: () -> Unit,
     onSave: (MonthlyRentalPlan) -> Unit,
     onClear: () -> Unit
 ) {
     var model by remember { mutableStateOf(initial.model) }
-    var periodMonth by remember { mutableStateOf(initial.periodMonth.ifBlank { currentMonth }) }
-    var feeText by remember { mutableStateOf(if (initial.monthlyFee > 0) initial.monthlyFee.toString() else "") }
-    var daysText by remember { mutableStateOf(if (initial.daysInMonth > 0) initial.daysInMonth.toString() else daysInCurrentMonth.toString()) }
+    val defaultMonth = runCatching { java.time.YearMonth.parse(initial.periodMonth.ifBlank { currentMonth }) }
+        .getOrElse { java.time.YearMonth.parse(currentMonth) }
+    var startDate by remember { mutableStateOf(initial.startDate.ifBlank { defaultMonth.atDay(1).toString() }) }
+    var endDate by remember { mutableStateOf(initial.endDate.ifBlank { defaultMonth.atEndOfMonth().toString() }) }
+    var feeText by remember { mutableStateOf(if (initial.feeCents > 0) yuan(initial.feeCents) else "") }
     var note by remember { mutableStateOf(initial.note) }
+    var paidDate by remember { mutableStateOf(initial.paidDate) }
+    var paymentMethod by remember { mutableStateOf(initial.paymentMethod) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    val focusManager = LocalFocusManager.current
 
-    val monthlyFee = feeText.toIntOrNull() ?: 0
-    val days = daysText.toIntOrNull() ?: daysInCurrentMonth
-    val computedDaily = if (days > 0 && monthlyFee > 0) monthlyFee / days else 0
+    val monthlyFee = cents(feeText)
+    val start = runCatching { LocalDate.parse(startDate.trim()) }.getOrNull()
+    val end = runCatching { LocalDate.parse(endDate.trim()) }.getOrNull()
+    val days = if (start != null && end != null && !end.isBefore(start)) ChronoUnit.DAYS.between(start, end).toInt() + 1 else 0
+    val computedDaily = if (days > 0 && monthlyFee > 0) monthlyFee / days else 0L
 
     AlertDialog(
         onDismissRequest = onDismiss,
         title = {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 Icon(Icons.Default.DirectionsCar, contentDescription = null, tint = Color(0xFF7B1FA2))
-                Text("月租車設定與每日成本計算", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                Text("租車期間與每日成本", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
             }
         },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
                 Text(
-                    "租車通常以月計費，請填寫月租資訊，系統將自動計算每日攤提成本並列入營業費用。",
+                    "請填寫租車起始日與結束日；費用只會計入這段期間，含起訖日。",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -1689,50 +1733,48 @@ private fun RentalPlanDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                // 租車月份
+                // 租車日期區間
                 OutlinedTextField(
-                    value = periodMonth,
-                    onValueChange = { periodMonth = it },
-                    label = { Text("租車期間 / 月份") },
-                    placeholder = { Text("例如：$currentMonth") },
+                    value = startDate,
+                    onValueChange = { startDate = it },
+                    label = { Text("起始日") },
+                    placeholder = { Text("YYYY-MM-DD") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = endDate,
+                    onValueChange = { endDate = it },
+                    label = { Text("結束日") },
+                    placeholder = { Text("YYYY-MM-DD") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                OutlinedTextField(paidDate, { paidDate = it }, label = { Text("租金付款日（YYYY-MM-DD；未付留空）") }, singleLine = true)
+                Row { listOf("現金", "轉帳").forEach { v ->
+                    FilterChip(paymentMethod == v, { paymentMethod = v }, label = { Text(v) })
+                    Spacer(Modifier.width(8.dp))
+                } }
+                Text("租期總費用只分攤一次，請勿再新增同一份租金為一般費用。", style = MaterialTheme.typography.bodySmall)
                 // 月租總費用
                 OutlinedTextField(
                     value = feeText,
                     onValueChange = { input ->
-                        if (input.all { it.isDigit() }) {
+                        if (input.all { it.isDigit() || it == '.' }) {
                             feeText = input
                             errorMessage = null
                         }
                     },
-                    label = { Text("月租總費用") },
-                    suffix = { Text("元/月") },
+                    label = { Text("租期總費用") },
+                    suffix = { Text("元") },
                     placeholder = { Text("例如：24000") },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
                     modifier = Modifier.fillMaxWidth()
                 )
 
-                // 計算天數
-                OutlinedTextField(
-                    value = daysText,
-                    onValueChange = { input ->
-                        if (input.all { it.isDigit() }) {
-                            daysText = input
-                            errorMessage = null
-                        }
-                    },
-                    label = { Text("每月計算天數") },
-                    suffix = { Text("天") },
-                    placeholder = { Text("例如：$daysInCurrentMonth") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-                    keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
-                    modifier = Modifier.fillMaxWidth()
-                )
+                Text("租期共 $days 天（含起訖日）", style = MaterialTheme.typography.bodySmall)
 
                 // 每日成本即時計算結果卡片
                 Surface(
@@ -1751,7 +1793,7 @@ private fun RentalPlanDialog(
                             color = Color(0xFF7B1FA2)
                         )
                         Text(
-                            text = "$monthlyFee 元 ÷ $days 天 ＝ 每日分攤 $computedDaily 元/天",
+                            text = "${yuan(monthlyFee)} 元 ÷ $days 天 ＝ 每日約 ${yuan(computedDaily)} 元（餘分自起始日補足）",
                             style = MaterialTheme.typography.bodyMedium,
                             fontWeight = FontWeight.Bold,
                             color = Color(0xFF7B1FA2)
@@ -1776,21 +1818,27 @@ private fun RentalPlanDialog(
         },
         confirmButton = {
             Button(onClick = {
-                if (monthlyFee <= 0) {
+                if (paidDate.isNotBlank() && runCatching { LocalDate.parse(paidDate) }.isFailure) {
+                    errorMessage = "請填有效付款日期，未付請留空"; return@Button
+                }
+                if (Money.parse(feeText) == null || monthlyFee <= 0) {
                     errorMessage = "請輸入有效的月租費用"
                     return@Button
                 }
                 if (days <= 0) {
-                    errorMessage = "計算天數需大於 0"
+                    errorMessage = "請輸入有效起訖日（YYYY-MM-DD），結束日不可早於起始日"
                     return@Button
                 }
                 onSave(
                     MonthlyRentalPlan(
                         model = model.trim(),
-                        periodMonth = periodMonth.trim(),
-                        monthlyFee = monthlyFee,
+                        periodMonth = "",
+                        startDate = startDate.trim(),
+                        endDate = endDate.trim(),
+                        paidDate = paidDate.trim(), paymentMethod = paymentMethod,
+                        feeCents = monthlyFee,
                         daysInMonth = days,
-                        dailyCost = computedDaily,
+                        dailyCostCents = computedDaily,
                         note = note.trim()
                     )
                 )
@@ -1800,7 +1848,7 @@ private fun RentalPlanDialog(
         },
         dismissButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                if (initial.monthlyFee > 0) {
+                if (initial.feeCents > 0) {
                     TextButton(
                         onClick = onClear,
                         colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
@@ -1824,9 +1872,12 @@ private fun ExpenseEditDialog(
     onConfirm: (ExpenseItem) -> Unit
 ) {
     var category by remember { mutableStateOf(initial.category) }
-    var amountText by remember { mutableStateOf(if (initial.amount > 0) initial.amount.toString() else "") }
+    var amountText by remember { mutableStateOf(if (initial.amountCents > 0) yuan(initial.amountCents) else "") }
     var timeText by remember { mutableStateOf(initial.time) }
     var noteText by remember { mutableStateOf(initial.note) }
+    var costEndDate by remember { mutableStateOf(initial.costEndDate) }
+    var paidDate by remember { mutableStateOf(initial.paidDate) }
+    var paymentMethod by remember { mutableStateOf(initial.paymentMethod) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
     val focusManager = LocalFocusManager.current
 
@@ -1856,7 +1907,7 @@ private fun ExpenseEditDialog(
                 OutlinedTextField(
                     value = amountText,
                     onValueChange = { input ->
-                        if (input.all { it.isDigit() }) {
+                        if (input.all { it.isDigit() || it == '.' }) {
                             amountText = input
                             errorMessage = null
                         }
@@ -1869,6 +1920,13 @@ private fun ExpenseEditDialog(
                     modifier = Modifier.fillMaxWidth()
                 )
 
+                Text("成本起始日：${initial.date}", style = MaterialTheme.typography.bodySmall)
+                OutlinedTextField(costEndDate, { costEndDate = it }, label = { Text("成本期間末日（YYYY-MM-DD；單日留空）") }, singleLine = true)
+                OutlinedTextField(paidDate, { paidDate = it }, label = { Text("實際付款日（YYYY-MM-DD；未付留空）") }, singleLine = true)
+                Row { listOf("現金", "轉帳").forEach { v ->
+                    FilterChip(paymentMethod == v, { paymentMethod = v }, label = { Text(v) })
+                    Spacer(Modifier.width(8.dp))
+                } }
                 // 時間（特別對加油提供明確時間標示）
                 OutlinedTextField(
                     value = timeText,
@@ -1906,16 +1964,27 @@ private fun ExpenseEditDialog(
         },
         confirmButton = {
             Button(onClick = {
-                val amt = amountText.toIntOrNull()
+                if (paidDate.isNotBlank() && runCatching { LocalDate.parse(paidDate) }.isFailure) {
+                    errorMessage = "請填有效付款日期，未付請留空"; return@Button
+                }
+                if (costEndDate.isNotBlank() && runCatching { LocalDate.parse(costEndDate) >= LocalDate.parse(initial.date) }.getOrDefault(false).not()) {
+                    errorMessage = "成本末日需有效且不可早於起始日"; return@Button
+                }
+                val amt = Money.parse(amountText)?.cents
                 if (amt == null || amt <= 0) {
                     errorMessage = "請輸入有效金額（需大於 0）"
+                    return@Button
+                }
+                val normalizedTime = if (timeText.isBlank()) "" else normalizeTime(timeText)
+                if (normalizedTime == null) {
+                    errorMessage = "時間請填有效 24 小時格式，例如 14:30、1430 或 14：30"
                     return@Button
                 }
                 onConfirm(
                     initial.copy(
                         category = category,
-                        amount = amt,
-                        time = timeText.trim(),
+                        amountCents = amt, paidDate = paidDate.trim(), paymentMethod = paymentMethod, costEndDate = costEndDate.trim(),
+                        time = normalizedTime,
                         note = noteText.trim()
                     )
                 )
@@ -1937,9 +2006,9 @@ private fun ExpenseEditDialog(
 internal data class WeekDayEfficiencyStat(
     val date: LocalDate,
     val dayName: String,
-    val revenue: Int,
-    val expense: Int,
-    val netProfit: Int,
+    val revenue: Long,
+    val expense: Long,
+    val netProfit: Long,
     val workDurationMins: Int,
     val tripDurationMins: Int,
     val completedCount: Int,
@@ -1956,7 +2025,7 @@ private fun WeeklyBarChartView(
     onSelectDate: (LocalDate) -> Unit
 ) {
     val maxMoney = remember(stats) {
-        maxOf(stats.maxOfOrNull { maxOf(it.revenue, it.expense) } ?: 0, 1000)
+        maxOf(stats.maxOfOrNull { maxOf(it.revenue, it.expense) } ?: 0L, 100000L)
     }
     val maxMins = remember(stats) {
         maxOf(stats.maxOfOrNull { maxOf(it.workDurationMins, it.tripDurationMins) } ?: 0, 120) // 至少以 2 小時為基準
@@ -1988,10 +2057,10 @@ private fun WeeklyBarChartView(
                         val net = dayStat.netProfit
                         if (dayStat.revenue > 0 || dayStat.expense > 0) {
                             val netStr = when {
-                                net >= 1000 -> "+${(net / 1000.0).let { if (it % 1.0 == 0.0) it.toInt().toString() else "%.1f".format(it) }}k"
-                                net <= -1000 -> "${(net / 1000.0).let { if (it % 1.0 == 0.0) it.toInt().toString() else "%.1f".format(it) }}k"
-                                net > 0 -> "+$net"
-                                else -> "$net"
+                                net >= 100000 -> "+${(net / 100000.0).let { if (it % 1.0 == 0.0) it.toInt().toString() else "%.1f".format(it) }}k"
+                                net <= -100000 -> "${(net / 100000.0).let { if (it % 1.0 == 0.0) it.toInt().toString() else "%.1f".format(it) }}k"
+                                net > 0 -> "+${yuan(net)}"
+                                else -> "${yuan(net)}"
                             }
                             Text(
                                 text = netStr,

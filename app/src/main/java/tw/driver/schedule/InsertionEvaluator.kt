@@ -64,8 +64,7 @@ internal class InsertionEvaluator(
             val target = client.resolve(next.pickup, next.pickupPlaceId, choose)
             client.compute(dropoff.id, target.id, ready)
         }
-        val normalized = input.copy(pickup = pickup.address.ifBlank { pickup.name }, destination = dropoff.address.ifBlank { dropoff.name })
-        val evaluated = assessInsertion(normalized, schedule, originLabel, start, toPickup, ride, toNext, padding)
+        val evaluated = assessInsertion(input, schedule, originLabel, start, toPickup, ride, toNext, padding)
         require(evaluated.isFresh(latestRides())) { "評估期間空檔已不足或排程狀態已變動，請重新評估" }
         return evaluated
     }

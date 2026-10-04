@@ -1,6 +1,9 @@
 package tw.driver.schedule
 
 import okhttp3.*
+import kotlinx.coroutines.CompletableDeferred
+import java.io.IOException
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -20,7 +23,9 @@ class LineFlowConnection(
     private val readyChanged: (Boolean) -> Unit = {},
     private val sendChanged: (String, String, String) -> Unit = { _, _, _ -> },
     private val acknowledgementTimeoutMillis: Long = 60_000,
-    private val authTimeoutMillis: Long = 15_000
+    private val authTimeoutMillis: Long = 15_000,
+    private val received: (LineMessage) -> Unit = {},
+    private val screenshotTimeoutMillis: Long = 15_000
 ) {
     private val worker = Executors.newSingleThreadScheduledExecutor()
     @Volatile private var stopped = false
@@ -34,11 +39,43 @@ class LineFlowConnection(
     private var authTimer: ScheduledFuture<*>? = null
     private var ready = false
     private val pending = mutableMapOf<String, ScheduledFuture<*>?>()
+    private class PendingScreenshot(val result: CompletableDeferred<ServerScreenshot>, val timer: ScheduledFuture<*>)
+    private val screenshots = mutableMapOf<String, PendingScreenshot>()
+    internal suspend fun screenshot(expectedSource: String): ServerScreenshot {
+        val id = "screen-${UUID.randomUUID()}"
+        val result = CompletableDeferred<ServerScreenshot>()
+        try {
+            if (stopped) throw IOException("訊息接收服務已停止，請先重新連線")
+            worker.execute {
+                if (!result.isActive) return@execute
+                if (stopped || !ready || expectedSource != settings.source) {
+                    result.completeExceptionally(IOException("尚未連線或來源已變更，請先完成 Message 連線"))
+                    return@execute
+                }
+                if (socket?.send(ScreenshotProtocol.request(id)) != true) {
+                    result.completeExceptionally(IOException("連線未接受截圖請求，請稍後重試"))
+                    return@execute
+                }
+                val timer = worker.schedule({
+                    screenshots.remove(id)?.result?.completeExceptionally(IOException("等待截圖逾時，請重新取得"))
+                }, screenshotTimeoutMillis, TimeUnit.MILLISECONDS)
+                screenshots[id] = PendingScreenshot(result, timer)
+            }
+            return result.await()
+        } catch (_: java.util.concurrent.RejectedExecutionException) {
+            throw IOException("訊息接收服務已停止，請先重新連線")
+        } finally {
+            result.cancel()
+            runCatching { worker.execute { screenshots.remove(id)?.timer?.cancel(false) } }
+        }
+    }
     private fun disconnectSending() {
         authenticated = false; authTimer?.cancel(false); authTimer = null
         ready = false; readyChanged(false)
         pending.forEach { (id, timer) -> timer?.cancel(false); sendChanged(id, "unknown", "連線中斷，未取得送出確認") }
         pending.clear()
+        screenshots.values.forEach { it.timer.cancel(false); it.result.completeExceptionally(IOException("連線中斷，請重新連線後取得截圖")) }
+        screenshots.clear()
     }
     fun send(request: OutgoingMessage) {
         if (stopped) { sendChanged(request.id, "not_sent", "接收服務已停止"); return }
@@ -104,11 +141,20 @@ class LineFlowConnection(
                         return@dispatch
                     }
                     if (event == LineFlowEvent.AuthOk) return@dispatch
+                    if (event is LineFlowEvent.ScreenshotResult) {
+                        screenshots.remove(event.requestId)?.let { pendingScreenshot ->
+                            pendingScreenshot.timer.cancel(false)
+                            if (event.image != null) pendingScreenshot.result.complete(event.image)
+                            else pendingScreenshot.result.completeExceptionally(IOException(event.error))
+                        }
+                        return@dispatch
+                    }
                     if (event is LineFlowEvent.SendResult && pending.containsKey(event.requestId)) {
                         pending.remove(event.requestId)?.cancel(false)
                         sendChanged(event.requestId, if (event.success) "success" else "error", event.error)
                     }
                     val result = session.accept(event, System.currentTimeMillis() / 1000)
+                    result.received.forEach { received(it) }
                     result.alerts.forEach { alert(it) }
                     result.nextRequest?.let {
                         syncSent = System.nanoTime()

@@ -22,9 +22,7 @@ android { namespace = "tw.driver.schedule"; compileSdk = 35
         manifestPlaceholders["MAPS_API_KEY"] = mapsApiKey
         buildConfigField("String", "MAPS_API_KEY", "\"$mapsApiKey\"")
         buildConfigField("String", "ROUTES_API_KEY", configString(localProperties.getProperty("ROUTES_API_KEY", mapsApiKey)))
-        buildConfigField("String", "GEMINI_API_KEY", configString(localProperties.getProperty("GEMINI_API_KEY", "")))
         buildConfigField("String", "GEMINI_MODEL", configString(localProperties.getProperty("GEMINI_MODEL", "gemini-2.5-flash")))
-        buildConfigField("String", "DEEPSEEK_API_KEY", configString(localProperties.getProperty("DEEPSEEK_API_KEY", "")))
         buildConfigField("String", "DEEPSEEK_MODEL", configString(localProperties.getProperty("DEEPSEEK_MODEL", "deepseek-flash")))
     }
     buildFeatures { compose = true; buildConfig = true }

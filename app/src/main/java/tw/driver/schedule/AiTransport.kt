@@ -55,7 +55,7 @@ internal object AiFailover {
 
     suspend fun <T> run(primary: (suspend () -> T)?, backup: (suspend () -> T)?,
                         onFallback: suspend () -> Unit): T {
-        if (primary == null) return backup?.invoke() ?: throw AiInputException("請設定 GEMINI_API_KEY 或 DEEPSEEK_API_KEY 並重新建置。")
+        if (primary == null) return backup?.invoke() ?: throw AiInputException("請先到設定 → Tab 1 填寫 API key 並儲存。")
         try { return primary() }
         catch (e: Exception) {
             if (!eligible(e) || backup == null) throw e

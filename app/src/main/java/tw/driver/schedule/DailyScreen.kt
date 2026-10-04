@@ -5,11 +5,13 @@ import android.net.Uri
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -23,6 +25,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
@@ -41,7 +44,7 @@ import java.time.format.DateTimeFormatter
 import java.time.LocalDate
 import java.time.LocalDateTime
 
-@Composable internal fun DailyScreen(rides: List<RideOrder>, onEdit: (RideOrder) -> Unit, onUpdate: (RideOrder) -> Unit, onImport: (List<RideOrder>) -> Unit) {
+@Composable internal fun DailyScreen(rides: List<RideOrder>, onEdit: (RideOrder, Boolean) -> Unit, onUpdate: (RideOrder) -> Unit, onImport: (List<RideOrder>) -> Unit, onSettings: () -> Unit, initialRide: RideOrder? = null) {
     val context = LocalContext.current
     val voiceCaller = remember { VoiceCallHelper(context) }
     DisposableEffect(voiceCaller) {
@@ -53,10 +56,14 @@ import java.time.LocalDateTime
         Toast.makeText(context, "已複製$label：$value", Toast.LENGTH_SHORT).show()
     }
     val prefs = remember { context.getSharedPreferences("appearance", 0) }
-    var compact by remember { mutableStateOf(prefs.getBoolean("compact", true)) }
-    var date by remember { mutableStateOf(LocalDate.now()) }
+    val compact = true
+    var actualMode by remember { mutableStateOf(false) }
+    var resetActualRide by remember { mutableStateOf<RideOrder?>(null) }
+    var date by remember { mutableStateOf(initialRide?.serviceDate?.let { runCatching { LocalDate.parse(it) }.getOrNull() } ?: LocalDate.now()) }
     var departureTime by remember(date) { mutableStateOf(prefs.getString("departure_time_$date", "") ?: "") }
     var returnHomeTime by remember(date) { mutableStateOf(prefs.getString("return_home_time_$date", "") ?: "") }
+    var journey by remember(date) { mutableStateOf(loadDailyJourney(prefs, date.toString())) }
+    var journeyRevision by remember { mutableIntStateOf(0) }
     var now by remember { mutableStateOf(LocalDateTime.now()) }
     var report by remember { mutableStateOf(false) }
     var transfer by remember { mutableStateOf(false) }
@@ -81,17 +88,66 @@ import java.time.LocalDateTime
     }
     LaunchedEffect(Unit) { while (true) { val fresh = LocalDateTime.now(); if (date == now.toLocalDate() && fresh.toLocalDate() != now.toLocalDate()) date = fresh.toLocalDate(); now = fresh; delay(15000) } }
     val day = rides.filter { it.serviceDate == date.toString() }.sortedBy { minuteOfDay(it.pickupTime) ?: Int.MAX_VALUE }
+    val defaultStartPoint = prefs.getString("default_start_point", "").orEmpty()
+    val effectiveStartPoint = journey.startPoint.ifBlank { defaultStartPoint }
+    val firstRide = day.firstOrNull()
+    val initialRouteKey = "$date|$effectiveStartPoint|${firstRide?.id}|${firstRide?.pickup}|$departureTime"
+    var initialTransferSeconds by remember(initialRouteKey) { mutableStateOf(
+        prefs.getString("initial_route_key_$date", "")?.takeIf { it == initialRouteKey }
+            ?.let { prefs.getLong("initial_route_seconds_$date", -1).takeIf { it >= 0 } }) }
+    var initialRouteRevision by remember { mutableIntStateOf(0) }
+    var initialRouteError by remember(initialRouteKey) { mutableStateOf<String?>(null) }
+    val actualTransfers = if (actualMode) actualTimelineTransfers(day, date).groupBy { it.rideId } else emptyMap()
     val visible = day
+    val caseListState = androidx.compose.runtime.key(date) { rememberLazyListState() }
+    var selectedRideId by remember(date, actualMode) { mutableStateOf<Long?>(null) }
+    var initialPositioned by remember(date) { mutableStateOf(false) }
+    val dragging by caseListState.interactionSource.collectIsDraggedAsState()
+    LaunchedEffect(dragging) {
+        if (dragging) { selectedRideId = null; initialPositioned = true }
+    }
+    LaunchedEffect(date, day.map { it.id }) {
+        if (!initialPositioned) {
+            (day.indexOfFirst { it.id == initialRide?.id }.takeIf { it >= 0 }
+                ?: initialScheduleRideIndex(day, date, now))?.let { index ->
+                initialPositioned = true
+                selectedRideId = day[index].id
+                caseListState.scrollToItem(index)
+            }
+        }
+    }
+    val readingRideId by remember(caseListState) {
+        derivedStateOf {
+            val layout = caseListState.layoutInfo
+            val index = scheduleReadingIndex(layout.visibleItemsInfo.map { ScheduleVisibleItem(it.index, it.offset, it.size) },
+                layout.viewportStartOffset, layout.viewportEndOffset, layout.totalItemsCount)
+            layout.visibleItemsInfo.firstOrNull { it.index == index }?.key as? Long
+        }
+    }
+    val highlightedRideId = selectedRideId?.takeIf { id -> day.any { it.id == id } } ?: readingRideId
     val scope = rememberCoroutineScope()
+    DisposableEffect(date) {
+        FirebaseSyncManager.onRemoteDailyJourneyUpdated = { updatedDate, updatedJourney ->
+            scope.launch {
+                journeyRevision++
+                if (updatedDate == date.toString()) journey = updatedJourney
+            }
+        }
+        onDispose { FirebaseSyncManager.onRemoteDailyJourneyUpdated = null }
+    }
     val messageStore = remember { MessageStore.get(context) }
     val sentMessages by messageStore.outgoing.collectAsState()
     var reportTarget by remember { mutableStateOf(prefs.getString("passenger_report_target", "小明").orEmpty()) }
-    var showReportSettings by remember { mutableStateOf(false) }
     var showReportHistory by remember { mutableStateOf(false) }
     fun passengerReport(order: RideOrder, boarding: Boolean) {
+        val timestamp = recordActualTime(order.serviceDate, java.time.LocalTime.now())
+        val updated = if (boarding && order.actualBoardedAt.isBlank()) order.copy(actualBoardedAt = timestamp)
+            else if (!boarding && order.actualAlightedAt.isBlank()) order.copy(actualAlightedAt = timestamp)
+            else order
+        if (updated != order) onUpdate(updated)
         val text = passengerStatusText(order, boarding)
         copy(if (boarding) "客上訊息" else "客下訊息", text)
-        val target = reportTarget.trim()
+        val target = order.reportTarget.trim().ifBlank { reportTarget.trim() }
         if (target.isBlank()) { message = "已複製。請先設定回報對象"; return }
         val source = messageStore.currentSource()
         scope.launch {
@@ -142,7 +198,7 @@ import java.time.LocalDateTime
             }
             // If the previous scheduled trip is already in the past, estimate transfer starting now.
             val plannedDropoff = scheduledPickup(previous).plusSeconds(300 + previousOwnSeconds + 300)
-            transferDeparture = maxOf(plannedDropoff, Instant.now().plusSeconds(5))
+            transferDeparture = maxOf(if (actualMode) actualRideInstant(previous.actualAlightedAt, previous.serviceDate) ?: plannedDropoff else plannedDropoff, Instant.now().plusSeconds(5))
             transfer = routeClient.compute(previousEnd.id, start.id, transferDeparture!!)
         } catch (e: CancellationException) { throw e }
         catch (e: Exception) { transferError = e.message ?: "銜接查詢失敗" }
@@ -170,6 +226,24 @@ import java.time.LocalDateTime
             finally { estimatingId = null; placeChoice = null }
         }
     }
+    LaunchedEffect(initialRouteKey, initialRouteRevision, actualMode, day.map { routeInputKey(it, previousFor(it)) }) {
+        if (estimateJob?.isActive == true) return@LaunchedEffect
+        if (effectiveStartPoint.isNotBlank() && firstRide != null && initialTransferSeconds == null) {
+            try {
+                val origin = routeClient.resolve(effectiveStartPoint, "", ::choosePlace)
+                val destination = routeClient.resolve(firstRide.pickup, firstRide.pickupPlaceId, ::choosePlace)
+                val configuredDeparture = minuteOfDay(departureTime)?.let { date.atStartOfDay(ZoneId.systemDefault()).plusMinutes(it.toLong()).toInstant() }
+                val seconds = routeClient.compute(origin.id, destination.id, maxOf(configuredDeparture ?: routeDeparture(firstRide, Instant.now()), Instant.now().plusSeconds(5))).seconds
+                initialTransferSeconds = seconds
+                prefs.edit().putString("initial_route_key_$date", initialRouteKey).putLong("initial_route_seconds_$date", seconds).apply()
+            } catch (e: CancellationException) { throw e }
+            catch (e: Exception) { initialRouteError = e.message ?: "首趟交通估算失敗" }
+        }
+        if (actualMode) {
+            val missing = day.zipWithNext().filter { (previous, ride) -> transferSeconds(ride, previous) == null }.map { it.second.id }
+            if (missing.isNotEmpty()) estimate(missing)
+        }
+    }
     val jsonExport = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
         if (uri != null) message = runCatching { context.contentResolver.openOutputStream(uri)?.bufferedWriter(Charsets.UTF_8)?.use { it.write(exportRecords(rides)) } ?: error("無法寫入"); "已匯出全部紀錄（不含原圖）" }.getOrElse { "匯出失敗：${it.message}" }
     }
@@ -185,26 +259,19 @@ import java.time.LocalDateTime
     }
     fun route(from: String, to: String) {
         if (listOf(from, to).any { it.isBlank() || it.contains("待確認") || it.contains("待填") }) { message = "請先修改並確認兩端地址"; return }
-        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/dir/?api=1&origin=${Uri.encode(addressForDisplay(from))}&destination=${Uri.encode(addressForDisplay(to))}&travelmode=driving"))) }.onFailure { message = "無法開啟 Google Maps" }
+        runCatching { context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/maps/dir/?api=1&origin=${Uri.encode(LocationTermsStore(context).load().expand(addressForDisplay(from)))}&destination=${Uri.encode(LocationTermsStore(context).load().expand(addressForDisplay(to)))}&travelmode=driving"))) }.onFailure { message = "無法開啟 Google Maps" }
     }
     Column(Modifier.fillMaxSize().padding(horizontal = 8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { date = date.minusDays(1) }) { Text("‹") }
-            Text(formatDateWithWeekday(date), modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-            TextButton(onClick = { date = LocalDate.now() }) { Text("今天") }
-            TextButton(onClick = { date = date.plusDays(1) }) { Text("›") }
+        DayNavigation(date, onSelect = { date = it }, modifier = Modifier.fillMaxWidth(), calendarEnabled = true)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilterChip(selected = !actualMode, onClick = { actualMode = false }, label = { Text("預計排班") })
+            FilterChip(selected = actualMode, onClick = { actualMode = true }, label = { Text("實際排班") }, colors = FilterChipDefaults.filterChipColors(selectedContainerColor = MaterialTheme.colorScheme.tertiaryContainer, selectedLabelColor = MaterialTheme.colorScheme.onTertiaryContainer))
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Text("精簡", style = MaterialTheme.typography.labelMedium)
-            Switch(
-                checked = compact,
-                onCheckedChange = { compact = it; prefs.edit().putBoolean("compact", it).apply() },
-                modifier = Modifier.height(28.dp)
-            )
             OutlinedButton(
                 onClick = { estimate(day.map { it.id }) },
                 enabled = day.isNotEmpty() && estimateJob?.isActive != true,
@@ -253,12 +320,19 @@ import java.time.LocalDateTime
         }
         if (estimateStatus.isNotBlank()) Text(estimateStatus, style = MaterialTheme.typography.labelMedium)
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { showReportSettings = true }) { Text("回報對象：${reportTarget.ifBlank { "未設定" }}") }
+            TextButton(onClick = onSettings) { Text("回報對象：${reportTarget.ifBlank { "未設定" }}") }
             TextButton(onClick = { showReportHistory = true }) { Text("回報紀錄") }
         }
         sentMessages.firstOrNull { it.actionKey.startsWith("passenger:") }?.let { Text("${it.target}：${it.text} · ${it.label}", style = MaterialTheme.typography.labelSmall) }
-        Text("${visible.size} 趟 · 實收 ${revenue(day).toPlainString()} 元", style = MaterialTheme.typography.bodyMedium)
+        Text("${visible.size} 趟 · 當日實收（含月結） ${yuan(collectedOn(rides, date))} 元", style = MaterialTheme.typography.bodyMedium)
+        Text(if (actualMode) "左側虛線：交通估算；金色：等待推算；點選或拖曳時間條可定位 case" else "左側虛線為交通時間，紅色表示銜接不足；點選或拖曳時間條可定位 case", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (visible.isEmpty()) Text("這天沒有行程。其他日期紀錄仍保留。", modifier = Modifier.padding(16.dp))
+        val previousEndOdometer = remember(date, journeyRevision, journey) {
+            loadDailyJourney(prefs, date.minusDays(1).toString()).endOdometer
+        }
+        val nextStartOdometer = remember(date, journeyRevision, journey) {
+            loadDailyJourney(prefs, date.plusDays(1).toString()).startOdometer
+        }
         Row(Modifier.weight(1f)) {
             ScheduleTimeline(
                 rides = day,
@@ -267,23 +341,55 @@ import java.time.LocalDateTime
                 modifier = Modifier.width(72.dp).fillMaxHeight(),
                 departureTime = departureTime,
                 returnHomeTime = returnHomeTime,
-                onSetDepartureTime = {
-                    departureTime = it
-                    prefs.edit().putString("departure_time_$date", it).apply()
-                    FirebaseSyncManager.uploadWorkHour(date.toString(), it, returnHomeTime)
+                journey = journey.copy(startPoint = effectiveStartPoint),
+                initialTransferSeconds = if (effectiveStartPoint.isNotBlank()) initialTransferSeconds else null,
+                suggestedStartOdometer = previousEndOdometer,
+                suggestedEndOdometer = nextStartOdometer,
+                highlightedRideId = highlightedRideId,
+                onSelectRide = { id ->
+                    initialPositioned = true
+                    selectedRideId = id
+                    val index = visible.indexOfFirst { it.id == id }
+                    if (index >= 0) scope.launch { caseListState.animateScrollToItem(index) }
                 },
-                onSetReturnHomeTime = {
-                    returnHomeTime = it
-                    prefs.edit().putString("return_home_time_$date", it).apply()
-                    FirebaseSyncManager.uploadWorkHour(date.toString(), departureTime, it)
+                actualMode = actualMode,
+                onSaveDeparture = { time, point, odometer ->
+                    if (saveDailyEndpoint(prefs, date.toString(), true, time, point, odometer)) {
+                        departureTime = time
+                        journey = journey.copy(startPoint = point, startOdometer = odometer)
+                        FirebaseSyncManager.uploadWorkHour(date.toString(), time, returnHomeTime)
+                        FirebaseSyncManager.uploadDailyJourney(date.toString(), journey)
+                        true
+                    } else false
+                },
+                onSaveReturnHome = { time, point, odometer ->
+                    if (saveDailyEndpoint(prefs, date.toString(), false, time, point, odometer)) {
+                        returnHomeTime = time
+                        journey = journey.copy(endPoint = point, endOdometer = odometer)
+                        FirebaseSyncManager.uploadWorkHour(date.toString(), departureTime, time)
+                        FirebaseSyncManager.uploadDailyJourney(date.toString(), journey)
+                        true
+                    } else false
                 }
             )
-            LazyColumn(modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp), verticalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp)) {
+            LazyColumn(state = caseListState, modifier = Modifier.weight(1f), contentPadding = PaddingValues(4.dp), verticalArrangement = Arrangement.spacedBy(if (compact) 3.dp else 6.dp)) {
                 itemsIndexed(visible, key = { _, it -> it.id }) { index, order ->
+                    if (index == 0 && effectiveStartPoint.isNotBlank()) {
+                        Text("起點：$effectiveStartPoint\n交通車程：${initialTransferSeconds?.let { "${routeMinutes(it)} 分鐘" } ?: initialRouteError ?: "自動估算中…"}",
+                            style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp))
+                        if (initialRouteError != null) TextButton(onClick = { initialRouteError = null; initialRouteRevision++ }, enabled = estimateJob?.isActive != true) { Text("重試起點交通估算") }
+                    }
                     if (index > 0) {
                         val transferEstimate = RouteEstimate.parse(order.routeEstimate)
-                        val transferMins = transferEstimate?.transferSeconds?.let { routeMinutes(it) }
-                            ?: order.transferMinutes.toLongOrNull()
+                        val transferMins = order.transferMinutes.toLongOrNull()
+                            ?: transferEstimate?.takeIf { it.key == routeInputKey(order, day.getOrNull(index - 1)) }?.transferSeconds?.let { routeMinutes(it) }
+                        val gapSegments = actualTransfers[order.id].orEmpty()
+                        val knownSplit = gapSegments.isNotEmpty() && gapSegments.none { it.kind == "未分類" }
+                        fun segmentMinutes(kind: String) = routeMinutes(kotlin.math.round(gapSegments.filter { it.kind == kind }.sumOf { (it.end - it.start) * 60 }).toLong())
+                        val transferText = if (!actualMode) "🚗 交通車程：${transferMins?.let { "$it 分鐘" } ?: "待估算"}"
+                            else if (knownSplit) "交通（估算）：${segmentMinutes("交通")} 分鐘\n等待（推算）：${segmentMinutes("等待")} 分鐘${if (gapSegments.any { it.conflicts }) " · 車程估算超過實際間隔" else ""}"
+                            else "交通（估算）：${transferMins?.let { "$it 分鐘" } ?: routeErrors[order.id] ?: "待估算"}\n等待：${if (gapSegments.isEmpty()) "待客上／客下紀錄" else "待交通估算"}"
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -303,7 +409,7 @@ import java.time.LocalDateTime
                                 modifier = Modifier.padding(horizontal = 6.dp)
                             ) {
                                 Text(
-                                    "🚗 交通車程：${transferMins?.let { "$it 分鐘" } ?: "待估算"}",
+                                    transferText,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
                                     style = MaterialTheme.typography.labelSmall,
                                     fontSize = 11.sp,
@@ -320,24 +426,29 @@ import java.time.LocalDateTime
                         }
                     }
                     val minute = minuteOfDay(order.pickupTime)
-                    val elapsed = date == now.toLocalDate() && minute != null && minute <= now.hour * 60 + now.minute
+                    val elapsed = !actualMode && date == now.toLocalDate() && minute != null && minute <= now.hour * 60 + now.minute
                     val billedSeconds = billedRideSeconds(order, day.getOrNull(day.indexOf(order) - 1))
-                    val durationMins = billedSeconds?.let { routeMinutes(it) } ?: order.rideMinutes.toLongOrNull()
+                    val durationMins = if (actualMode) actualRideMinutes(order)
+                        else billedSeconds?.let { routeMinutes(it) } ?: order.rideMinutes.toLongOrNull()
                     val durationColor = when {
                         durationMins == null -> Color(0xFF9E9E9E)
                         durationMins <= 20 -> Color(0xFF2E7D32) // 短程 (綠)
                         durationMins <= 40 -> Color(0xFFE65100) // 中程 (橙)
                         else -> Color(0xFFC62828)               // 長程 (紅)
                     }
+                    val caseColor = rideCaseColor(order.category)
+                    val distanceColor = rideDistanceColor(RouteEstimate.parse(order.routeEstimate)?.meters)
 
                     ElevatedCard(
-                        onClick = { onEdit(order) },
+                        onClick = { onEdit(order, actualMode) },
                         modifier = Modifier
                             .fillMaxWidth()
-                            .alpha(if (order.completed) 0.65f else 1.0f)
-                            .then(if (order.completed) Modifier.border(1.5.dp, Color(0xFF4CAF50).copy(alpha = 0.65f), CardDefaults.elevatedShape) else Modifier),
+                            .alpha(if (order.completed) 0.82f else 1.0f)
+                            .border(if (order.id == highlightedRideId) 3.dp else 2.dp, if (order.id == highlightedRideId) (if (actualMode) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.primary) else distanceColor.copy(alpha = if (order.completed) 0.65f else 0.9f), CardDefaults.elevatedShape),
                         colors = CardDefaults.elevatedCardColors(
-                            containerColor = if (order.completed) {
+                            containerColor = if (actualMode) {
+                                MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = if (order.completed) 0.35f else 0.55f)
+                            } else if (order.completed) {
                                 MaterialTheme.colorScheme.surfaceContainerLowest
                             } else if (elapsed) {
                                 MaterialTheme.colorScheme.secondaryContainer
@@ -348,17 +459,17 @@ import java.time.LocalDateTime
                     ) {
                         CompositionLocalProvider(LocalMinimumInteractiveComponentSize provides if (compact) 40.dp else 48.dp) {
                         Row(Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
-                            // 根據時間長短用不同顏色表達指示條
+                            // 左側邊框表示距離；Case 類型仍由標籤表示。
                             Box(
                                 Modifier
-                                    .width(5.dp)
+                                    .width(7.dp)
                                     .fillMaxHeight()
-                                    .background(if (order.completed) Color(0xFF81C784).copy(alpha = 0.5f) else durationColor)
+                                    .background(distanceColor)
                             )
                             Column(Modifier.weight(1f).padding(horizontal = 6.dp, vertical = if(compact) 2.dp else 8.dp)) {
                                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                                     Text(
-                                        order.pickupTime,
+                                        if (actualMode) actualTimeLabel(order.actualBoardedAt) else order.pickupTime,
                                         modifier = Modifier.weight(1f),
                                         style = MaterialTheme.typography.titleMedium,
                                         fontSize = 18.sp,
@@ -401,12 +512,20 @@ import java.time.LocalDateTime
                                         }
                                     }
                                     RideCategoryTag(if(order.returnRide) "回程" else "去程")
-                                    RideCategoryTag(if(order.category == "補助單") "補助" else order.category)
+                                    RideCaseTag(order.category)
                                     CompletionToggle(order.completed, compact) { onUpdate(order.copy(completed = it)) }
                                 }
                                 if (!compact && elapsed && !order.completed) Text("已到接客時間", style = MaterialTheme.typography.labelMedium)
                                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                                    Text(order.customer, modifier = Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 18.sp)
+                                    Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                                        Text(order.customer, modifier = Modifier.weight(1f, fill = false), maxLines = 2, overflow = TextOverflow.Ellipsis, fontSize = 18.sp)
+                                        Icon(
+                                            imageVector = if (order.wheelchair) Icons.Default.Accessible else Icons.Default.DirectionsWalk,
+                                            contentDescription = if (order.wheelchair) "輪椅" else "一般行走",
+                                            modifier = Modifier.size(20.dp),
+                                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                     IconButton(
                                         onClick = {
                                             val phone = order.contactPhone.ifBlank { order.passengerPhone }
@@ -430,25 +549,19 @@ import java.time.LocalDateTime
                                 ScheduleAddressLine("上車", order.pickup, compact, onCopy = { copy("上車地點", addressForDisplay(order.pickup)) }, onNavigate = { launchNavigation(context, order.pickup, order.pickupPlaceId) })
                                 ScheduleAddressLine("下車", order.destination, compact, onCopy = { copy("下車地點", addressForDisplay(order.destination)) }, onNavigate = { launchNavigation(context, order.destination, order.destinationPlaceId) })
                                 if (!compact) {
-                                    val feeParts = buildList {
-                                        if (order.fare.isNotBlank()) add("費用: ${order.fare}元")
-                                        if (order.received.isNotBlank()) add("實收: ${order.received}元")
-                                        if (order.tip.isNotBlank()) add("TIP: ${order.tip}元")
-                                        if (order.subsidyDue.isNotBlank()) add("待收補助: ${order.subsidyDue}元")
-                                    }.joinToString(" · ")
+                                    val feeParts = caseFeeText(order)
                                     Text("${if(order.returnRide) "回程" else "去程"}${if(order.tentative) " · 暫定" else ""}${if(order.timeFlexible) " · 時間可調" else ""}${if(order.wheelchair) " · 需輪椅" else ""}${if (feeParts.isNotBlank()) " · $feeParts" else " · 費用未填"}", style = MaterialTheme.typography.bodyMedium)
                                 }
                                 if (!compact) {
                                     Text("聯絡人：${order.contact} ${order.contactPhone}")
                                     if (order.passengerPhone.isNotBlank()) Text("乘客電話：${order.passengerPhone}")
-                                    if (order.bookingId.isNotBlank()) Text("訂單編號：${order.bookingId}")
                                     if (order.transferMinutes.isNotBlank() && order.transferMinutes != "0") Text("上一趟交通銜接：${order.transferMinutes} 分鐘")
-                                    if (order.subsidyDue.isNotBlank()) Text("待收補助：NT$ ${order.subsidyDue}")
+                                    if (order.reportTarget.isNotBlank()) Text("客上／客下回報對象：${order.reportTarget}")
                                     if (order.uncertainties.isNotBlank()) Text("待確認：${order.uncertainties}", color = MaterialTheme.colorScheme.error)
                                     if (order.notes.isNotBlank()) Text(order.notes)
                                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                                         Button(
-                                            onClick = { onEdit(order) },
+                                            onClick = { onEdit(order, actualMode) },
                                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 2.dp),
                                             modifier = Modifier.height(36.dp)
                                         ) {
@@ -461,9 +574,13 @@ import java.time.LocalDateTime
                                                     id = System.nanoTime(),
                                                     completed = false,
                                                     received = "",
+                                                    tip = "",
+                                                    monthlyReceipts = emptyList(),
+                                                    actualBoardedAt = "",
+                                                    actualAlightedAt = "",
                                                     routeEstimate = ""
                                                 )
-                                                onEdit(duplicate)
+                                                onEdit(duplicate, false)
                                             },
                                             contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp),
                                             modifier = Modifier.height(36.dp)
@@ -472,23 +589,10 @@ import java.time.LocalDateTime
                                         }
                                     }
                                 }
-                                if (compact) Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    val eta = calculateEta(order.pickupTime, durationMins)
-                                    Text("車程 ${durationMins?.let { "$it 分" } ?: "待估"}${if(routeErrors[order.id] != null) " · 失敗" else ""}", style = MaterialTheme.typography.bodyMedium, color = durationColor)
-                                    if (order.received.isNotBlank()) {
-                                        Surface(
-                                            color = Color(0xFFE8F5E9),
-                                            shape = RoundedCornerShape(4.dp)
-                                        ) {
-                                            Text(
-                                                "實收 $${order.received}${if (order.tip.isNotBlank()) "+TIP$${order.tip}" else ""}",
-                                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                                                style = MaterialTheme.typography.labelSmall,
-                                                fontWeight = FontWeight.Bold,
-                                                color = Color(0xFF2E7D32)
-                                            )
-                                        }
-                                    }
+                                if (compact) {
+                                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    val eta = if (actualMode) null else calculateEta(order.pickupTime, durationMins)
+                                    Text("${if (actualMode) "實際載客" else "車程"} ${durationMins?.let { "$it 分" } ?: if (actualMode) "待記錄" else "待估"}${if(!actualMode && routeErrors[order.id] != null) " · 失敗" else ""}", style = MaterialTheme.typography.bodyMedium, color = durationColor)
                                     if (eta != null) {
                                         Surface(
                                             color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = if (order.completed) 0.45f else 0.85f),
@@ -505,6 +609,24 @@ import java.time.LocalDateTime
                                     }
                                     Spacer(Modifier.weight(1f))
                                     TextButton(onClick = { estimate(listOf(order.id)) }, enabled = estimateJob?.isActive != true, modifier = Modifier.height(40.dp), contentPadding = PaddingValues(horizontal = 4.dp)) { Text(if(estimatingId == order.id) "更新中…" else "更新車程") }
+                                }
+                                if (actualMode) Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("客上 ${actualTimeLabel(order.actualBoardedAt)}\n客下 ${actualTimeLabel(order.actualAlightedAt)}", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelMedium)
+                                    if (order.actualBoardedAt.isNotBlank() || order.actualAlightedAt.isNotBlank())
+                                        TextButton(onClick = { resetActualRide = order }) { Text("重設時間") }
+                                }
+                                if (caseFeeText(order).isNotBlank()) Surface(
+                                    color = caseColor.copy(alpha = 0.12f),
+                                    shape = RoundedCornerShape(4.dp)
+                                ) {
+                                    Text(
+                                        caseFeeText(order),
+                                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 3.dp),
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = caseColor
+                                    )
+                                }
                                 } else RouteEstimateInfo(order, day.getOrNull(day.indexOf(order) - 1), routeErrors[order.id])
                                 if (!compact) TextButton(onClick = { estimate(listOf(order.id)) }, enabled = estimateJob?.isActive != true) {
                                     Text(if (estimatingId == order.id) "更新車程中…" else "更新此趟車程")
@@ -524,21 +646,11 @@ import java.time.LocalDateTime
         }
         if (!compact) Text("時間軸按車程等比例顯示；圓點表示車程未知。", style = MaterialTheme.typography.labelMedium)
     }
-    if (showReportSettings) {
-        var target by remember { mutableStateOf(reportTarget) }
-        var error by remember { mutableStateOf("") }
-        AlertDialog(onDismissRequest = { showReportSettings = false }, title = { Text("客上／客下回報對象") }, text = {
-            Column {
-                OutlinedTextField(target, { target = it }, label = { Text("LINE 聊天室或聯絡人名稱") }, singleLine = true)
-                Text("點客上／客下會複製字串，並透過 Message 連線回報到此對象。請填寫完整名稱。", style = MaterialTheme.typography.bodySmall)
-                if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
-            }
-        }, confirmButton = { TextButton(enabled = target.isNotBlank(), onClick = {
-            scope.launch {
-                val saved = withContext(Dispatchers.IO) { prefs.edit().putString("passenger_report_target", target.trim()).commit() }
-                if (saved) { reportTarget = target.trim(); showReportSettings = false } else error = "儲存失敗，請重試"
-            }
-        }) { Text("儲存") } }, dismissButton = { TextButton(onClick = { showReportSettings = false }) { Text("取消") } })
+    resetActualRide?.let { ride ->
+        AlertDialog(onDismissRequest = { resetActualRide = null }, title = { Text("重設實際上下車時間") },
+            text = { Text("${ride.customer.ifBlank { ride.pickup }} 的客上、客下時間會清空，可再次按按鈕重新記錄。") },
+            confirmButton = { TextButton(onClick = { onUpdate(ride.copy(actualBoardedAt = "", actualAlightedAt = "")); resetActualRide = null }) { Text("重設") } },
+            dismissButton = { TextButton(onClick = { resetActualRide = null }) { Text("取消") } })
     }
     if (showReportHistory) OutgoingHistoryDialog(onDismiss = { showReportHistory = false }, passengerOnly = true)
     placeChoice?.let { choice ->
@@ -555,21 +667,8 @@ import java.time.LocalDateTime
                 Text("若沒有正確地點，請取消並修改地址。", style = MaterialTheme.typography.bodySmall)
             } }, confirmButton = {}, dismissButton = { TextButton(onClick = { choice.result.cancel(); estimateJob?.cancel() }) { Text("取消估算") } })
     }
-    if (report) {
-        val summary = daySummary(day)
-        AlertDialog(onDismissRequest = { report = false }, title = { Text("$date 日結") }, text = { Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text("排程趟數：${summary.scheduled}")
-            Text("實際完成趟數：${summary.completed}")
-            Text("自費趟數：${summary.selfPay}")
-            Text("補助趟數：${summary.subsidized}")
-            Text("日照趟數：${summary.daycare}")
-            Text("實際車程計費時間：${summary.seconds / 3600} 小時 ${(summary.seconds % 3600) / 60} 分 ${summary.seconds % 60} 秒${if(summary.missingTime > 0) "（${summary.missingTime} 趟待填）" else ""}")
-            Text("實收費用：${summary.receipts.toPlainString()} 元${if(summary.missingReceipts > 0) "（${summary.missingReceipts} 趟待填）" else ""}")
-            Text("小費 (TIP)：${summary.tips.toPlainString()} 元")
-            Text("待收補助：${summary.subsidy.toPlainString()} 元${if(summary.missingSubsidy > 0) "（${summary.missingSubsidy} 趟待填）" else ""}")
-            Text("已完成載客路段加總；手填優先，否則採有效估算，非 GPS 實測。不含空車銜接及上下車緩衝。", style = MaterialTheme.typography.labelSmall)
-        } }, confirmButton = { TextButton(onClick = { report = false }) { Text("關閉") } })
-    }
+    if (report) DayClosingDialog(date, day, departureTime, returnHomeTime, onDismiss = { report = false },
+        onEdit = { ride -> report = false; onEdit(ride, true) })
     if (transfer) AlertDialog(onDismissRequest = { transfer = false }, title = { Text("資料同步與匯出") }, text = { Column {
         Text("雲端同步尚未設定。預計使用 Firebase＋外部瀏覽器 Google 登入，以支援無 Google 服務的裝置。目前可用 JSON 交換資料。")
         TextButton(onClick = { jsonExport.launch("driver-records.json") }) { Text("匯出全部 JSON（可還原）") }
@@ -685,11 +784,36 @@ import java.time.LocalDateTime
 }
 
 
+private fun rideDistanceColor(meters: Long?): Color = when {
+    meters == null || meters < 0 -> Color(0xFF69717C) // 尚無距離
+    meters < 5_000 -> Color(0xFF7154A4) // 短程
+    meters < 15_000 -> Color(0xFFA34687) // 中程
+    else -> Color(0xFFB32635) // 長程
+}
+
+@Composable private fun rideCaseColor(category: String): Color = when (category) {
+    "自費" -> if (MaterialTheme.colorScheme.background.luminance() < 0.5f) Color(0xFFFFA640) else Color(0xFFB95500)
+    "補助單", "補助" -> Color(0xFF1747A6)
+    "日照" -> Color(0xFF08745B)
+    else -> Color(0xFF596579)
+}
+
+@Composable private fun RideCaseTag(category: String) {
+    val label = if (category == "補助單") "補助" else category
+    val darkOrange = category == "自費" && MaterialTheme.colorScheme.background.luminance() < 0.5f
+    Surface(color = rideCaseColor(category), shape = RoundedCornerShape(6.dp)) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 9.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = FontWeight.ExtraBold,
+            color = if (darkOrange) Color.Black else Color.White
+        )
+    }
+}
+
 @Composable private fun RideCategoryTag(category: String) {
     val tint = when (category) {
-        "自費" -> Color(0xFFD79939)
-        "補助單", "補助" -> Color(0xFF598ED8)
-        "日照" -> Color(0xFF53A88B)
         "去程" -> Color(0xFF7B8FC4)
         "回程" -> Color(0xFFAD82B6)
         else -> MaterialTheme.colorScheme.outline
@@ -721,6 +845,7 @@ import java.time.LocalDateTime
         TextButton(onClick = onCopy, contentPadding = PaddingValues(4.dp), modifier = Modifier.width(44.dp).height(if(compact) 40.dp else 48.dp).semantics { contentDescription = "複製${label}地點" }) { Text("複製") }
         TextButton(onClick = onNavigate, contentPadding = PaddingValues(4.dp), modifier = Modifier.width(44.dp).height(if(compact) 40.dp else 48.dp).semantics { contentDescription = "導航至${label}地點" }) { Text("導航") }
     }
+    LocationTermComment(address)
 }
 
 @Composable private fun PassengerMessageButton(boarding: Boolean, compact: Boolean = false, onClick: () -> Unit) {

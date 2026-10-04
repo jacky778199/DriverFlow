@@ -47,13 +47,24 @@ class MessageSettingsStore(private val context: Context) {
 }
 
 class MessageStore private constructor(context: Context) : SQLiteOpenHelper(context,
-    File(context.noBackupFilesDir, "lineflow.db").absolutePath, null, 2) {
+    File(context.noBackupFilesDir, "lineflow.db").absolutePath, null, 3) {
     private val prefs = context.getSharedPreferences("message_rules", Context.MODE_PRIVATE)
     private val notificationManager = context.getSystemService(android.app.NotificationManager::class.java)
     private val _keywords = MutableStateFlow(runCatching {
-        prefs.getString("keywords", null)?.let { raw -> JSONArray(raw).let { a -> List(a.length()) { a.getString(it) } } } ?: MessageKeywords.defaults
+        prefs.getString("keywords", null)?.let { raw ->
+            JSONArray(raw).let { a -> List(a.length()) { a.getString(it) } }
+                .let { saved -> if (saved == listOf("即時可等", "報分", "跳表", "自費", "+300", "+400")) MessageKeywords.defaults else saved }
+        } ?: MessageKeywords.defaults
     }.getOrDefault(MessageKeywords.defaults))
     val keywords = _keywords.asStateFlow()
+    private val _senderAlertRules = MutableStateFlow(runCatching {
+        prefs.getString("sender_alert_rules", null)?.let { raw ->
+            JSONArray(raw).let { array -> List(array.length()) { index ->
+                array.getJSONObject(index).let { SenderAlertRule(it.getString("chat"), it.getString("sender")) }
+            } }
+        } ?: emptyList()
+    }.getOrDefault(emptyList()))
+    val senderAlertRules = _senderAlertRules.asStateFlow()
     val canSend = MutableStateFlow(false)
     private val _outgoing = MutableStateFlow<List<OutgoingMessage>>(emptyList())
     val outgoing = _outgoing.asStateFlow()
@@ -62,12 +73,16 @@ class MessageStore private constructor(context: Context) : SQLiteOpenHelper(cont
     val messages = _messages.asStateFlow()
     private val _unread = MutableStateFlow(0)
     val unread = _unread.asStateFlow()
+    private val _feasibleUnread = MutableStateFlow(0)
+    val feasibleUnread = _feasibleUnread.asStateFlow()
+    private val _evaluationStates = MutableStateFlow<Map<Long, Boolean>>(emptyMap())
+    val evaluationStates = _evaluationStates.asStateFlow()
     val status = MutableStateFlow("未連線")
     val active = MutableStateFlow(false)
     private var source = ""
     @Synchronized fun currentSource() = source
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE messages (source TEXT NOT NULL, seq INTEGER NOT NULL, instance TEXT NOT NULL, chat TEXT NOT NULL, sender TEXT NOT NULL, content TEXT NOT NULL, time TEXT NOT NULL, timestamp INTEGER NOT NULL, unread INTEGER NOT NULL, PRIMARY KEY(source, seq))")
+        db.execSQL("CREATE TABLE messages (source TEXT NOT NULL, seq INTEGER NOT NULL, instance TEXT NOT NULL, chat TEXT NOT NULL, sender TEXT NOT NULL, content TEXT NOT NULL, time TEXT NOT NULL, timestamp INTEGER NOT NULL, unread INTEGER NOT NULL, feasible INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(source, seq))")
         db.execSQL("CREATE TABLE cursors (source TEXT PRIMARY KEY, seq INTEGER NOT NULL, initialized INTEGER NOT NULL)")
         createOutbox(db)
     }
@@ -75,7 +90,10 @@ class MessageStore private constructor(context: Context) : SQLiteOpenHelper(cont
         db.execSQL("CREATE TABLE outgoing (id TEXT PRIMARY KEY, source TEXT NOT NULL, action_key TEXT NOT NULL, target TEXT NOT NULL, body TEXT NOT NULL, state TEXT NOT NULL, detail TEXT NOT NULL, created INTEGER NOT NULL)")
         db.execSQL("CREATE INDEX outgoing_action ON outgoing(source,action_key,created)")
     }
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) { if (oldVersion < 2) createOutbox(db) }
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) createOutbox(db)
+        if (oldVersion < 3) db.execSQL("ALTER TABLE messages ADD COLUMN feasible INTEGER NOT NULL DEFAULT 0")
+    }
     @Synchronized fun migrateSource(old: String, new: String) {
         val db = writableDatabase
         db.beginTransaction()
@@ -159,6 +177,17 @@ class MessageStore private constructor(context: Context) : SQLiteOpenHelper(cont
         writableDatabase.execSQL("UPDATE messages SET unread=0 WHERE source=? AND seq<=?", arrayOf(source, throughSeq))
         refresh()
     }
+    @Synchronized fun saveSenderAlertRules(text: String) = saveSenderAlertRules(SenderAlertRules.parse(text))
+    @Synchronized fun saveSenderAlertRules(input: List<SenderAlertRule>) {
+        val rules = SenderAlertRules.validate(input)
+        val json = JSONArray().apply { rules.forEach { put(JSONObject().put("chat", it.chat).put("sender", it.sender)) } }
+        check(prefs.edit().putString("sender_alert_rules", json.toString()).commit()) { "提醒規則儲存失敗" }
+        _senderAlertRules.value = rules
+    }
+    @Synchronized fun setFeasible(key: String, seq: Long, feasible: Boolean) {
+        writableDatabase.execSQL("UPDATE messages SET feasible=? WHERE source=? AND seq=?", arrayOf(if (feasible) 1 else -1, key, seq))
+        if (source == key) refresh()
+    }
     @Synchronized fun postIfUnread(key: String, message: LineMessage, post: () -> Unit) {
         if (source != key || MessageKeywords.match(message.content, keywords.value).isEmpty()) return
         val unread = readableDatabase.rawQuery("SELECT unread FROM messages WHERE source=? AND seq=?", arrayOf(key, message.seq.toString())).use { it.moveToFirst() && it.getInt(0) == 1 }
@@ -172,10 +201,14 @@ class MessageStore private constructor(context: Context) : SQLiteOpenHelper(cont
             } }
         }
         _unread.value = readableDatabase.rawQuery("SELECT content FROM messages WHERE source=? AND unread=1", arrayOf(source)).use { c -> var count = 0; while (c.moveToNext()) if (MessageKeywords.match(c.getString(0), keywords.value).isNotEmpty()) count++; count }
+        _feasibleUnread.value = readableDatabase.rawQuery("SELECT COUNT(*) FROM messages WHERE source=? AND unread=1 AND feasible=1", arrayOf(source)).use { c -> if (c.moveToFirst()) c.getInt(0) else 0 }
+        _evaluationStates.value = readableDatabase.rawQuery("SELECT seq,feasible FROM messages WHERE source=? AND feasible!=0 ORDER BY seq DESC LIMIT 500", arrayOf(source)).use { c ->
+            buildMap { while (c.moveToNext()) put(c.getLong(0), c.getInt(1) == 1) }
+        }
         val unreadTags = readableDatabase.rawQuery("SELECT instance,seq,content FROM messages WHERE source=? AND unread=1", arrayOf(source)).use { c -> buildSet {
             while (c.moveToNext()) if (MessageKeywords.match(c.getString(2), keywords.value).isNotEmpty()) add("${c.getString(0)}:${c.getLong(1)}")
         } }
-        notificationManager.activeNotifications.filter { it.notification.channelId == MessageService.ALERT_CHANNEL && it.tag !in unreadTags }
+        notificationManager.activeNotifications.filter { it.notification.channelId in setOf(MessageService.ALERT_CHANNEL, MessageService.EVALUATION_CHANNEL) && it.tag?.removePrefix("evaluation:") !in unreadTags }
             .forEach { notificationManager.cancel(it.tag, it.id) }
     }
     companion object {

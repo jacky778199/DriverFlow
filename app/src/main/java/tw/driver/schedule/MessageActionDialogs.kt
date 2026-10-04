@@ -26,7 +26,7 @@ import java.time.Instant
     AlertDialog(onDismissRequest = { if (!saving) onDismiss() }, title = { Text("搶單關鍵字") }, text = {
         Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             Text("每行一個，任一命中就高亮並提醒。清空可停用關鍵字提醒。")
-            OutlinedTextField(text, { text = it }, modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 260.dp), enabled = !saving)
+            OutlinedTextField(text, { text = it }, label = { Text("提醒關鍵字（每行一個）") }, modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 260.dp), enabled = !saving)
             TextButton(onClick = { text = MessageKeywords.defaults.joinToString("\n") }, enabled = !saving) { Text("恢復預設") }
             Text("儲存後立即套用到背景收訊與現有清單，不會為舊訊息補發通知。", style = MaterialTheme.typography.bodySmall)
             if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
@@ -35,6 +35,39 @@ import java.time.Instant
         saving = true
         scope.launch {
             try { withContext(Dispatchers.IO) { store.saveKeywords(text) }; onDismiss() }
+            catch (e: Exception) { error = e.message ?: "儲存失敗" }
+            finally { saving = false }
+        }
+    }) { Text("儲存") } }, dismissButton = { TextButton(enabled = !saving, onClick = onDismiss) { Text("取消") } })
+}
+
+@Composable internal fun SenderAlertSettingsDialog(onDismiss: () -> Unit) {
+    val store = MessageStore.get(LocalContext.current)
+    val rules by store.senderAlertRules.collectAsState()
+    var rows by remember { mutableStateOf(rules) }
+    var error by remember { mutableStateOf("") }
+    var saving by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+    AlertDialog(onDismissRequest = { if (!saving) onDismiss() }, title = { Text("群組與發送者提醒") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text("群組與發送者同時符合時就提醒，不需包含關鍵字。請使用 Message 顯示的完整名稱。")
+            rows.forEachIndexed { index, rule ->
+                OutlinedTextField(rule.chat, { value -> rows = rows.toMutableList().also { it[index] = rule.copy(chat = value) } },
+                    label = { Text("第 ${index + 1} 組 · 群組名稱") }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !saving)
+                OutlinedTextField(rule.sender, { value -> rows = rows.toMutableList().also { it[index] = rule.copy(sender = value) } },
+                    label = { Text("發送者名稱") }, modifier = Modifier.fillMaxWidth(), singleLine = true, enabled = !saving)
+                TextButton(onClick = { rows = rows.filterIndexed { i, _ -> i != index } }, enabled = !saving) { Text("移除此組") }
+                HorizontalDivider()
+            }
+            if (rows.isEmpty()) Text("尚無指定提醒。移除全部並儲存可停用。")
+            OutlinedButton(onClick = { rows = rows + SenderAlertRule("", "") }, enabled = !saving && rows.size < 50) { Text("新增一組提醒") }
+            Text("忽略前後空白與全半形差異。首次歷史同步不補發通知；重新連線只提醒最近 2 分鐘的新訊息。", style = MaterialTheme.typography.bodySmall)
+            if (error.isNotBlank()) Text(error, color = MaterialTheme.colorScheme.error)
+        }
+    }, confirmButton = { TextButton(enabled = !saving, onClick = {
+        saving = true
+        scope.launch {
+            try { withContext(Dispatchers.IO) { store.saveSenderAlertRules(rows) }; onDismiss() }
             catch (e: Exception) { error = e.message ?: "儲存失敗" }
             finally { saving = false }
         }

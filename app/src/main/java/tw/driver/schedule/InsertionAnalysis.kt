@@ -25,6 +25,12 @@ internal object InsertionAnalysis {
         entries.value = (entries.value + ((source to seq) to entry)).entries.toList().takeLast(200).associate { it.toPair() }
     }
 
+    @Synchronized fun invalidate() {
+        tasks.values.toList().forEach { it.cancel() }
+        tasks.clear()
+        entries.value = emptyMap()
+    }
+
     fun enqueue(context: Context, source: String, message: LineMessage) {
         task(context.applicationContext, source, message, false)
     }
@@ -42,20 +48,20 @@ internal object InsertionAnalysis {
                 var entry = InsertionAnalysisEntry(status = "自動解析起訖點與接客時間…")
                 save(source, message.seq, entry)
                 try {
-                    val parsed = InsertionParser.extract(message.content, LocalDate.now())
+                    val settings = withContext(Dispatchers.IO) { AiSettingsStore(context).load() }
+                    val terms = withContext(Dispatchers.IO) { LocationTermsStore(context).load() }
+                    val parsed = InsertionParser.extract(message.content, LocalDate.now(), settings, terms)
                     entry = entry.copy(case = parsed)
                     save(source, message.seq, entry)
                     val evaluator = InsertionEvaluator(GoogleRouteClient.create(context),
                         { query, _ -> error("「$query」有多個地點，請開啟評估選擇") },
-                        {
-                            check(foreground) { "已解析；請開啟評估取得現在位置" }
-                            currentMessageLocation(context)
-                        }, { progress -> save(source, message.seq, entry.copy(status = progress)) })
+                        { currentMessageLocation(context) },
+                        { progress -> save(source, message.seq, entry.copy(status = progress)) })
                     val rides = OrderStore(context).load()
                     val result = evaluator.evaluate(parsed, rides, { OrderStore(context).load() })
                     entry = entry.copy(result = result, status = "自動評估完成")
                 } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { entry = entry.copy(status = e.message ?: "請開啟評估補齊資料") }
+                catch (e: Exception) { entry = entry.copy(status = "自動評估失敗：${e.message ?: "請開啟評估補齊資料"}") }
                 save(source, message.seq, entry)
                 entry
             }

@@ -16,6 +16,17 @@ class AiBookingParserTest {
     private fun envelope(vararg orders: JSONObject) = JSONObject().put("imageTranscript", "截圖文字，尚待校對")
         .put("orders", JSONArray(orders.toList())).toString()
 
+    @Test fun glossaryKeepsRawAddressesAndImageTranscriptAcrossRoundTripDrafts() {
+        val source = "北院去南院，回程13:00"
+        val terms = LocationTerms(listOf(LocationTerm("北院", "北區醫院"), LocationTerm("南院", "南區醫院")))
+        val json = envelope(fixture().put("pickup", "北區醫院").put("destination", "南區醫院"))
+        val drafts = AiBookingParser.decode(json, source, "", terms)
+        assertEquals("北院", drafts.first().pickup)
+        assertEquals("南院", drafts.first().destination)
+        assertEquals("南院", drafts.last().pickup)
+        assertEquals(source, drafts.first().raw)
+        assertEquals("截圖文字，尚待校對", drafts.first().imageTranscript)
+    }
     @Test fun preservesSourceRangeUnknownYearAndDistinctPeople() {
         val order = AiBookingParser.decode(envelope(fixture()), "原始訊息", "/private/image.png").first()
         assertEquals("10:00–10:30", order.pickupTime)

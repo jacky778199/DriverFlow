@@ -60,7 +60,8 @@ internal class GoogleRouteClient(
         .callTimeout(25, TimeUnit.SECONDS).retryOnConnectionFailure(false).followRedirects(false).build(),
     private val routesUrl: String = "https://routes.googleapis.com/directions/v2:computeRoutes",
     private val placesUrl: String = "https://places.googleapis.com/v1/places:searchText",
-    private val placesApiKey: String = apiKey
+    private val placesApiKey: String = apiKey,
+    private val locationTerms: () -> LocationTerms = { LocationTerms() }
 ) {
     // Only selected Place IDs are cached, not transient traffic data.
     private val resolved = mutableMapOf<String, RoutePlace>()
@@ -69,7 +70,7 @@ internal class GoogleRouteClient(
         fun create(context: Context): GoogleRouteClient {
             val signature = context.packageManager.getPackageInfo(context.packageName, PackageManager.GET_SIGNATURES).signatures?.firstOrNull()?.toByteArray()
             val sha1 = signature?.let { MessageDigest.getInstance("SHA-1").digest(it).joinToString("") { b -> "%02X".format(b.toInt() and 255) } }.orEmpty()
-            return GoogleRouteClient(BuildConfig.ROUTES_API_KEY, context.packageName, sha1, placesApiKey = BuildConfig.MAPS_API_KEY)
+            return GoogleRouteClient(BuildConfig.ROUTES_API_KEY, context.packageName, sha1, placesApiKey = BuildConfig.MAPS_API_KEY, locationTerms = { LocationTermsStore(context).load() })
         }
     }
     private suspend fun post(url: String, mask: String, data: JSONObject): JSONObject {
@@ -100,8 +101,8 @@ internal class GoogleRouteClient(
     }
     suspend fun resolve(address: String, knownId: String, choose: suspend (String, List<RoutePlace>) -> RoutePlace): RoutePlace {
         if (knownId.isNotBlank()) return RoutePlace(knownId, address, address)
-        resolved[address]?.let { return it }
-        val query = addressForDisplay(address).trim()
+        val query = locationTerms().expand(addressForDisplay(address)).trim()
+        resolved[query]?.let { return it }
         if (query.isBlank() || query.contains("待填") || query.contains("地點待確認")) throw IOException("請先填寫完整地點")
         val result = post(placesUrl, "places.id,places.displayName,places.formattedAddress,nextPageToken",
             JSONObject().put("textQuery", query).put("languageCode", "zh-TW").put("regionCode", "TW").put("pageSize", 20))
@@ -112,7 +113,7 @@ internal class GoogleRouteClient(
         if (places.isEmpty()) throw IOException("Google 找不到「$query」，請修改地址或使用 Google 搜尋選取")
         val selected = if (places.size == 1 && result.optString("nextPageToken").isBlank()) places.single() else choose(query, places)
         require(places.any { it.id == selected.id })
-        resolved[address] = selected
+        resolved[query] = selected
         return selected
     }
     suspend fun locateHospital(name: String, address: String): HospitalLocation {

@@ -11,7 +11,7 @@ data class LineMessage(
 )
 
 object MessageKeywords {
-    val defaults = listOf("即時可等", "報分", "跳表", "自費", "+300", "+400")
+    val defaults = listOf("即時可等", "即時", "報分", "跳表", "自費", "+300", "+400")
     private fun normalize(text: String) = Normalizer.normalize(text, Normalizer.Form.NFKC)
             .replace(Regex("[\\s\\p{Z}\\u200B\\uFEFF]+"), "")
     fun parseSettings(text: String): List<String> {
@@ -22,11 +22,12 @@ object MessageKeywords {
     }
     fun match(text: String, keywords: List<String> = defaults): List<String> {
         val normalized = normalize(text)
-        return keywords.filter { raw ->
+        val matched = keywords.filter { raw ->
             val keyword = normalize(raw)
             if (keyword.matches(Regex("\\+[0-9]+"))) Regex(Regex.escape(keyword) + "(?![0-9])").containsMatchIn(normalized)
             else keyword.isNotEmpty() && normalized.contains(keyword)
         }
+        return if (matched.any { normalize(it) == "即時可等" }) matched.filterNot { normalize(it) == "即時" } else matched
     }
 }
 
@@ -51,6 +52,7 @@ class LineFlowSettings(val endpoint: String = DEFAULT_ENDPOINT,
 sealed interface LineFlowEvent {
     data object AuthOk : LineFlowEvent
     data object AuthFail : LineFlowEvent
+    class ScreenshotResult(val requestId: String, val image: ServerScreenshot?, val error: String) : LineFlowEvent
     data class SendResult(val requestId: String, val success: Boolean, val error: String) : LineFlowEvent
     data class Batch(val since: Long, val messages: List<LineMessage>) : LineFlowEvent
     data class New(val message: LineMessage) : LineFlowEvent
@@ -86,6 +88,7 @@ object LineFlowProtocol {
                 LineFlowEvent.SendResult(json.getString("request_id"), json.getString("status") == "success",
                     if (json.isNull("error_message")) "" else json.optString("error_message").take(300))
             }
+            "screenshot_result" -> ScreenshotProtocol.result(json)
             "pong" -> LineFlowEvent.Pong
             "new_message" -> LineFlowEvent.New(message(json.getJSONObject("data")))
             "sync_batch" -> {
@@ -111,13 +114,14 @@ class LineFlowSession(private val store: LineFlowPersistence) {
     private var liveMax = requested
     private val returning = store.initialized()
     fun initialRequest() = LineFlowProtocol.sync(requested)
-    data class Result(val alerts: List<LineMessage> = emptyList(), val nextRequest: String? = null, val connected: Boolean = false)
+    data class Result(val alerts: List<LineMessage> = emptyList(), val nextRequest: String? = null,
+        val connected: Boolean = false, val received: List<LineMessage> = emptyList())
     fun accept(event: LineFlowEvent, now: Long): Result = when (event) {
         is LineFlowEvent.New -> {
             val message = event.message
             val fresh = if (message.seq <= store.cursor()) emptyList() else store.save(listOf(message.copy(unread = message.keywords.isNotEmpty())), if (syncing) null else message.seq)
             liveMax = maxOf(liveMax, message.seq)
-            Result(alerts = fresh.filter { it.keywords.isNotEmpty() })
+            Result(alerts = fresh.filter { it.keywords.isNotEmpty() }, received = fresh)
         }
         is LineFlowEvent.Batch -> {
             require(syncing && event.since == requested) { "同步回應游標不符" }
@@ -128,7 +132,8 @@ class LineFlowSession(private val store: LineFlowPersistence) {
                 if (more) end else maxOf(end, liveMax), !more)
             requested = end
             syncing = more
-            Result(fresh.filter { it.unread }, if (more) LineFlowProtocol.sync(end) else null, !more)
+            Result(fresh.filter { it.unread }, if (more) LineFlowProtocol.sync(end) else null, !more,
+                fresh.filter { returning && now - it.timestamp in 0..120 })
         }
         else -> Result()
     }

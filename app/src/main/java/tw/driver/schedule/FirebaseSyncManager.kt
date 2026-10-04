@@ -39,6 +39,7 @@ object FirebaseSyncManager {
     var onRemoteRidesUpdated: ((remoteRides: List<RideOrder>, deletedIds: Set<Long>) -> Unit)? = null
     var onRemoteExpensesUpdated: ((remoteExpenses: List<ExpenseItem>, deletedIds: Set<Long>) -> Unit)? = null
     var onRemoteWorkHourUpdated: ((date: String, departure: String, returnHome: String, breakStart: String, breakEnd: String) -> Unit)? = null
+    internal var onRemoteDailyJourneyUpdated: ((date: String, journey: DailyJourney) -> Unit)? = null
     var onRemoteRentalPlanUpdated: ((MonthlyRentalPlan) -> Unit)? = null
 
     private var initialized = false
@@ -246,6 +247,16 @@ object FirebaseSyncManager {
                 editor.putString("break_start_time_$date", pauseStart)
                 editor.putString("break_end_time_$date", pauseEnd)
                 onRemoteWorkHourUpdated?.invoke(date, dep, ret, pauseStart, pauseEnd)
+                if (listOf("startPoint", "endPoint", "startOdometer", "endOdometer").any(data::containsKey)) {
+                    val journey = DailyJourney(
+                        data["startPoint"] as? String ?: "",
+                        data["endPoint"] as? String ?: "",
+                        data["startOdometer"] as? String ?: "",
+                        data["endOdometer"] as? String ?: ""
+                    )
+                    saveDailyJourney(prefs, date, journey)
+                    onRemoteDailyJourneyUpdated?.invoke(date, journey)
+                }
             }
             editor.apply()
         }
@@ -257,14 +268,7 @@ object FirebaseSyncManager {
                 return@addSnapshotListener
             }
             snapshot?.data?.let { data ->
-                val plan = MonthlyRentalPlan(
-                    model = data["model"] as? String ?: "",
-                    periodMonth = data["periodMonth"] as? String ?: "",
-                    monthlyFee = (data["monthlyFee"] as? Number)?.toInt() ?: 0,
-                    daysInMonth = (data["daysInMonth"] as? Number)?.toInt() ?: 30,
-                    dailyCost = (data["dailyCost"] as? Number)?.toInt() ?: 0,
-                    note = data["note"] as? String ?: ""
-                )
+                val plan = org.json.JSONObject(data).toRentalPlan()
                 try {
                     ExpenseStore(appContext).saveRentalPlan(plan)
                 } catch (e: Exception) {
@@ -296,6 +300,16 @@ object FirebaseSyncManager {
             .collection("rides").document(ride.id.toString())
             .set(rideToMap(ride, isDeleted = false), SetOptions.merge())
             .addOnFailureListener { Log.w(TAG, "Failed to upload ride ${ride.id}", it) }
+    }
+
+    fun uploadRidesAtomically(rides: List<RideOrder>) {
+        if (rides.isEmpty()) return
+        val uid = auth.currentUser?.uid ?: return
+        require(rides.size <= 450) { "一次最多 450 趟，請分批收款" }
+        val batch = firestore.batch()
+        rides.forEach { ride -> batch.set(firestore.collection("users").document(uid).collection("rides")
+            .document(ride.id.toString()), rideToMap(ride), SetOptions.merge()) }
+        batch.commit().addOnFailureListener { Log.w(TAG, "Failed to upload collection batch", it) }
     }
 
     fun deleteRide(rideId: Long) {
@@ -338,19 +352,26 @@ object FirebaseSyncManager {
             .addOnFailureListener { Log.w(TAG, "Failed to upload work hour for $date", it) }
     }
 
+    internal fun uploadDailyJourney(date: String, journey: DailyJourney) {
+        val uid = auth.currentUser?.uid ?: return
+        firestore.collection("users").document(uid)
+            .collection("work_hours").document(date)
+            .set(mapOf(
+                "date" to date,
+                "startPoint" to journey.startPoint,
+                "endPoint" to journey.endPoint,
+                "startOdometer" to journey.startOdometer,
+                "endOdometer" to journey.endOdometer,
+                "updatedAt" to System.currentTimeMillis()
+            ), SetOptions.merge())
+            .addOnFailureListener { Log.w(TAG, "Failed to upload daily journey for $date", it) }
+    }
+
     fun uploadRentalPlan(plan: MonthlyRentalPlan) {
         val uid = auth.currentUser?.uid ?: return
         firestore.collection("users").document(uid)
             .collection("settings").document("rental_plan")
-            .set(mapOf(
-                "model" to plan.model,
-                "periodMonth" to plan.periodMonth,
-                "monthlyFee" to plan.monthlyFee,
-                "daysInMonth" to plan.daysInMonth,
-                "dailyCost" to plan.dailyCost,
-                "note" to plan.note,
-                "updatedAt" to System.currentTimeMillis()
-            ), SetOptions.merge())
+            .set(rentalPlanMap(plan) + mapOf("updatedAt" to System.currentTimeMillis()), SetOptions.merge())
             .addOnFailureListener { Log.w(TAG, "Failed to upload rental plan", it) }
     }
 
@@ -394,15 +415,7 @@ object FirebaseSyncManager {
                     ), SetOptions.merge())
                 }
                 val planRef = userDoc.collection("settings").document("rental_plan")
-                batch.set(planRef, mapOf(
-                    "model" to rentalPlan.model,
-                    "periodMonth" to rentalPlan.periodMonth,
-                    "monthlyFee" to rentalPlan.monthlyFee,
-                    "daysInMonth" to rentalPlan.daysInMonth,
-                    "dailyCost" to rentalPlan.dailyCost,
-                    "note" to rentalPlan.note,
-                    "updatedAt" to System.currentTimeMillis()
-                ), SetOptions.merge())
+                batch.set(planRef, rentalPlanMap(rentalPlan) + mapOf("updatedAt" to System.currentTimeMillis()), SetOptions.merge())
 
                 batch.commit().addOnSuccessListener {
                     onComplete("已成功同步 ${rides.size} 筆排程、${expenses.size} 筆花費與 ${workHours.size} 天工時至雲端！")
@@ -444,19 +457,31 @@ object FirebaseSyncManager {
         "serviceDate" to ride.serviceDate,
         "category" to ride.category,
         "completed" to ride.completed,
-        "received" to ride.received,
+        "receivedCents" to ride.received.takeIf { it.isNotBlank() }?.let { cents(it) },
+        "moneyVersion" to 3,
+        "receiptsManaged" to ride.receiptsManaged,
+        "amountDueCents" to ride.amountDue.takeIf { it.isNotBlank() }?.let { cents(it) },
+        "monthlyReceipts" to ride.monthlyReceipts.map { mapOf("id" to it.id, "date" to it.date, "kind" to it.kind, "amountCents" to cents(it.amount), "method" to it.method, "batchId" to it.batchId) },
         "rideMinutes" to ride.rideMinutes,
         "transferMinutes" to ride.transferMinutes,
         "pickupPlaceId" to ride.pickupPlaceId,
         "destinationPlaceId" to ride.destinationPlaceId,
         "routeEstimate" to ride.routeEstimate,
-        "subsidyDue" to ride.subsidyDue,
-        "tip" to ride.tip,
+        "subsidyDueCents" to ride.subsidyDue.takeIf { it.isNotBlank() }?.let { cents(it) },
+        "tipCents" to ride.tip.takeIf { it.isNotBlank() }?.let { cents(it) },
+        "daycareMonthlyCents" to ride.daycareMonthly.takeIf { it.isNotBlank() }?.let { cents(it) },
+        "reportTarget" to ride.reportTarget,
+        "actualBoardedAt" to ride.actualBoardedAt,
+        "actualAlightedAt" to ride.actualAlightedAt,
         "updatedAt" to System.currentTimeMillis(),
         "isDeleted" to isDeleted
     )
 
-    private fun mapToRide(map: Map<String, Any?>): RideOrder = RideOrder(
+    private fun mapMoney(map: Map<String, Any?>, key: String): String =
+        if (map.containsKey("${key}Cents")) (map["${key}Cents"] as? Number)?.toLong()?.let { yuan(it) } ?: ""
+        else map[key] as? String ?: ""
+
+    private fun mapToRide(map: Map<String, Any?>): RideOrder = migrateRideMoney(RideOrder(
         id = (map["id"] as? Number)?.toLong() ?: 0L,
         date = map["date"] as? String ?: "",
         pickupTime = map["pickupTime"] as? String ?: "",
@@ -481,21 +506,31 @@ object FirebaseSyncManager {
         serviceDate = map["serviceDate"] as? String ?: "",
         category = map["category"] as? String ?: "未分類",
         completed = map["completed"] as? Boolean ?: false,
-        received = map["received"] as? String ?: "",
+        received = mapMoney(map, "received"),
         rideMinutes = map["rideMinutes"] as? String ?: "",
         transferMinutes = map["transferMinutes"] as? String ?: "",
         pickupPlaceId = map["pickupPlaceId"] as? String ?: "",
         destinationPlaceId = map["destinationPlaceId"] as? String ?: "",
         routeEstimate = map["routeEstimate"] as? String ?: "",
-        subsidyDue = map["subsidyDue"] as? String ?: "",
-        tip = map["tip"] as? String ?: ""
-    )
+        subsidyDue = mapMoney(map, "subsidyDue"),
+        tip = mapMoney(map, "tip"),
+        daycareMonthly = if (map.containsKey("daycareMonthly") || map.containsKey("daycareMonthlyCents")) mapMoney(map, "daycareMonthly")
+            else if (map["category"] == "日照") map["received"] as? String ?: "" else "",
+        reportTarget = map["reportTarget"] as? String ?: "",
+        actualBoardedAt = map["actualBoardedAt"] as? String ?: "",
+        actualAlightedAt = map["actualAlightedAt"] as? String ?: "",
+        amountDue = mapMoney(map, "amountDue"),
+        receiptsManaged = map["receiptsManaged"] as? Boolean ?: false,
+        monthlyReceipts = parseMonthlyReceipts((map["monthlyReceipts"] as? List<*>)?.let { org.json.JSONArray(it) })
+    ), !map.containsKey("moneyVersion"))
 
     private fun expenseToMap(expense: ExpenseItem, isDeleted: Boolean = false): Map<String, Any?> = mapOf(
         "id" to expense.id,
         "date" to expense.date,
         "category" to expense.category,
-        "amount" to expense.amount,
+        "amountCents" to expense.amountCents,
+        "paidDate" to expense.paidDate, "paymentMethod" to expense.paymentMethod,
+        "costEndDate" to expense.costEndDate,
         "time" to expense.time,
         "note" to expense.note,
         "updatedAt" to System.currentTimeMillis(),
@@ -506,7 +541,10 @@ object FirebaseSyncManager {
         id = (map["id"] as? Number)?.toLong() ?: 0L,
         date = map["date"] as? String ?: "",
         category = map["category"] as? String ?: "其他",
-        amount = (map["amount"] as? Number)?.toInt() ?: 0,
+        amountCents = (map["amountCents"] as? Number)?.toLong() ?: ((map["amount"] as? Number)?.toLong() ?: 0) * 100,
+        paidDate = map["paidDate"] as? String ?: (map["date"] as? String ?: ""),
+        paymentMethod = map["paymentMethod"] as? String ?: "現金",
+        costEndDate = map["costEndDate"] as? String ?: "",
         time = map["time"] as? String ?: "",
         note = map["note"] as? String ?: ""
     )

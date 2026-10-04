@@ -32,7 +32,29 @@ class LineFlowTest {
 
     @Test fun normalizesFullWidthAndWhitespaceWithoutMatchingLargerAmounts() {
         assertEquals(listOf("即時可等", "報分", "跳表", "自費", "+300", "+400"), MessageKeywords.match("即時 可等 報分 跳表 自費 ＋３００ / + 400"))
+        assertEquals(listOf("即時"), MessageKeywords.match("即時 台大醫院 → 台北車站"))
         assertTrue(MessageKeywords.match("300元 +3000 +4000 一般預約").isEmpty())
+    }
+    @Test fun senderRulesRequireBothNamesAndAllowRegularMessages() {
+        val rules = SenderAlertRules.parse("搶單群 | 王司機\n 搶單群|王司機 ")
+        assertEquals(1, rules.size)
+        assertTrue(SenderAlertRules.matches(LineMessage(1, "instance1", "搶單群", "王司機", "一般訊息", "", 1000), rules))
+        assertFalse(SenderAlertRules.matches(LineMessage(2, "instance1", "其他群", "王司機", "一般訊息", "", 1000), rules))
+        assertFalse(SenderAlertRules.matches(LineMessage(3, "instance1", "搶單群", "其他人", "一般訊息", "", 1000), rules))
+        assertThrows(IllegalArgumentException::class.java) { SenderAlertRules.parse("搶單群|") }
+    }
+    @Test fun senderNotificationsUseFreshLiveAndRecentBackfillWithoutOldHistory() {
+        val initial = MemoryStore()
+        val first = LineFlowSession(initial)
+        assertTrue(first.accept(LineFlowEvent.Batch(0, listOf(message(1, "一般訊息"))), 1000).received.isEmpty())
+        assertEquals(listOf(2L), first.accept(LineFlowEvent.New(message(2, "一般訊息")), 1000).received.map { it.seq })
+        assertTrue(first.accept(LineFlowEvent.New(message(2, "一般訊息")), 1000).received.isEmpty())
+
+        val returning = LineFlowSession(MemoryStore(10, true))
+        val result = returning.accept(LineFlowEvent.Batch(10,
+            listOf(message(11, "一般訊息", 700), message(12, "一般訊息", 950))), 1000)
+        assertEquals(listOf(12L), result.received.map { it.seq })
+        assertTrue(result.alerts.isEmpty())
     }
     @Test fun validatesAndEncodesCredentialsWithoutEmbeddingThemInSettingsString() {
         val settings = LineFlowSettings("wss://example.com/ws/lineflow", "a&b ?", "instance 1")

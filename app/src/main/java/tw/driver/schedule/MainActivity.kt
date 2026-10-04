@@ -19,8 +19,6 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.SwapVert
@@ -28,6 +26,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.window.Dialog
@@ -73,7 +72,10 @@ data class RideOrder(
     val completed: Boolean = false, val received: String = "",
     val rideMinutes: String = "", val transferMinutes: String = "",
     val pickupPlaceId: String = "", val destinationPlaceId: String = "", val routeEstimate: String = "", val subsidyDue: String = "",
-    val tip: String = ""
+    val tip: String = "", val daycareMonthly: String = "", val reportTarget: String = "",
+    val actualBoardedAt: String = "", val actualAlightedAt: String = "",
+    val amountDue: String = "", val monthlyReceipts: List<MonthlyReceipt> = emptyList(),
+    val receiptsManaged: Boolean = false
 )
 
 class OrderStore(context: Context) {
@@ -81,7 +83,7 @@ class OrderStore(context: Context) {
     fun load(): List<RideOrder> = runCatching {
         val array = JSONArray(prefs.getString("items", "[]"))
         List(array.length()) { i -> array.getJSONObject(i).toOrder() }.also { migrated ->
-            if ((0 until array.length()).any { !array.getJSONObject(it).has("serviceDate") }) save(migrated)
+            if ((0 until array.length()).any { !array.getJSONObject(it).has("serviceDate") || array.getJSONObject(it).optInt("moneyVersion") < 3 }) save(migrated)
         }
     }.getOrDefault(emptyList())
     fun save(items: List<RideOrder>) {
@@ -98,11 +100,14 @@ internal fun RideOrder.toJson() = JSONObject().apply {
     put("fare", fare); put("bookingId", bookingId)
     put("serviceDate", serviceDate); put("category", category); put("completed", completed)
     put("pickupPlaceId", pickupPlaceId); put("destinationPlaceId", destinationPlaceId); put("routeEstimate", routeEstimate)
-    put("subsidyDue", subsidyDue)
-    put("received", received); put("rideMinutes", rideMinutes); put("transferMinutes", transferMinutes)
-    put("tip", tip)
+    putMoney("subsidyDue", subsidyDue)
+    putMoney("received", received); put("rideMinutes", rideMinutes); put("transferMinutes", transferMinutes)
+    putMoney("tip", tip); putMoney("daycareMonthly", daycareMonthly); put("reportTarget", reportTarget)
+    put("actualBoardedAt", actualBoardedAt); put("actualAlightedAt", actualAlightedAt)
+    put("moneyVersion", 3); putMoney("amountDue", amountDue); put("receiptsManaged", receiptsManaged)
+    put("monthlyReceipts", monthlyReceiptsJson(monthlyReceipts))
 }
-internal fun JSONObject.toOrder() = RideOrder(
+internal fun JSONObject.toOrder() = migrateRideMoney(RideOrder(
     id = getLong("id"),
     date = getString("date"),
     pickupTime = getString("time"),
@@ -129,15 +134,21 @@ internal fun JSONObject.toOrder() = RideOrder(
     serviceDate = optString("serviceDate").ifBlank { fullRideDate(getString("date")) },
     category = optString("category", "未分類"),
     completed = optBoolean("completed", false),
-    received = optString("received"),
+    received = readMoney("received"),
     rideMinutes = optString("rideMinutes"),
     transferMinutes = optString("transferMinutes"),
     pickupPlaceId = optString("pickupPlaceId"),
     destinationPlaceId = optString("destinationPlaceId"),
     routeEstimate = optString("routeEstimate"),
-    subsidyDue = optString("subsidyDue"),
-    tip = optString("tip")
-)
+    subsidyDue = readMoney("subsidyDue"),
+    tip = readMoney("tip"),
+    daycareMonthly = if (has("daycareMonthly") || has("daycareMonthlyCents")) readMoney("daycareMonthly")
+        else if (optString("category") == "日照") optString("received") else "",
+    reportTarget = optString("reportTarget"),
+    actualBoardedAt = optString("actualBoardedAt"), actualAlightedAt = optString("actualAlightedAt"),
+    amountDue = readMoney("amountDue"), monthlyReceipts = parseMonthlyReceipts(optJSONArray("monthlyReceipts")),
+    receiptsManaged = optBoolean("receiptsManaged")
+), !has("moneyVersion"))
 
 /** 移除預設的提示性文字，讓使用者在手動新增時欄位完全空白，不需手動 backspace 刪除 */
 internal fun stripPlaceholder(str: String): String {
@@ -204,9 +215,12 @@ private data class PlacePick(val target: String, val label: String, val placeId:
     }
     var rides by remember { mutableStateOf(store.load()) }
     var tab by remember { mutableIntStateOf(1) }
+    var financeRide by remember { mutableStateOf<RideOrder?>(null) }
+    var settingsTab by remember { mutableIntStateOf(1) }
     val messageStore = remember { MessageStore.get(context) }
     val messageUnread by messageStore.unread.collectAsState()
-    LaunchedEffect(messageRequest) { if (messageRequest != 0L) tab = 4 }
+    val feasibleUnread by messageStore.feasibleUnread.collectAsState()
+    LaunchedEffect(messageRequest) { if (messageRequest != 0L) tab = 5 }
     LaunchedEffect(Unit) {
         runCatching {
             val settings = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
@@ -216,11 +230,11 @@ private data class PlacePick(val target: String, val label: String, val placeId:
         }.onFailure { messageStore.status.value = "無法啟動接收，請檢查 Message 連線設定" }
     }
     var editing by remember { mutableStateOf<RideOrder?>(null) }
+    var editingActualMode by remember { mutableStateOf(false) }
     val ai: AiInputViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
     var placeTarget by remember { mutableStateOf<String?>(null) }
     var placePick by remember { mutableStateOf<PlacePick?>(null) }
     var showSyncDialog by remember { mutableStateOf(false) }
-    val currentUser by FirebaseSyncManager.currentUser.collectAsState()
 
     LaunchedEffect(Unit) {
         FirebaseSyncManager.init(context.applicationContext)
@@ -256,51 +270,66 @@ private data class PlacePick(val target: String, val label: String, val placeId:
     }
     fun update(list: List<RideOrder>) { rides = list; store.save(list) }
     MaterialTheme(colorScheme = if (darkMode) darkColorScheme(primary = Color(0xFF8BD5BF)) else lightColorScheme(primary = Color(0xFF176B5A))) {
-        Scaffold(topBar = { TopAppBar(title = { Text("DriverRoutine", maxLines = 1, overflow = TextOverflow.Ellipsis) }, actions = {
-            IconButton(
-                onClick = { showSyncDialog = true },
-                modifier = Modifier.semantics { contentDescription = "雲端同步設定" }
-            ) {
-                Icon(
-                    imageVector = if (currentUser != null) Icons.Default.CloudDone else Icons.Default.Cloud,
-                    contentDescription = "雲端同步狀態",
-                    tint = if (currentUser != null) Color(0xFF4CAF50) else MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
+        Scaffold(topBar = { TopAppBar(title = { Text(androidx.compose.ui.res.stringResource(R.string.app_name), maxLines = 1, overflow = TextOverflow.Ellipsis) }, actions = {
             Text("深色", style = MaterialTheme.typography.labelMedium)
             Switch(checked = darkMode, onCheckedChange = {
                 darkMode = it
                 preferences.edit().putBoolean("dark_mode", it).apply()
             }, modifier = Modifier.padding(horizontal = 8.dp).semantics { contentDescription = "深色模式" })
         }) }, bottomBar = {
-            NavigationBar { listOf("新增 / 擷取", "當日排程", "花費", "地圖入口", "Message").forEachIndexed { index, label ->
-                val urgent = index == 4 && messageUnread > 0
-                NavigationBarItem(selected = tab == index, onClick = { tab = index },
-                    modifier = if (urgent) Modifier.background(MaterialTheme.colorScheme.tertiaryContainer) else Modifier,
-                    icon = { BadgedBox(badge = { if (urgent) Badge { Text(if (messageUnread > 99) "99+" else messageUnread.toString()) } }) { Text((index + 1).toString()) } },
-                    label = { Text(label, maxLines = 1, fontWeight = if (urgent) FontWeight.Bold else FontWeight.Normal) })
-            } }
+            Column {
+                if (tab == 4) SettingsPageTabs(settingsTab) { settingsTab = it }
+                NavigationBar { appPageLabels.forEachIndexed { index, label ->
+                    val urgent = index == 5 && messageUnread > 0
+                    val relatedPage = tab == 4 && settingsTab == index
+                    NavigationBarItem(selected = tab == index, onClick = {
+                        financeRide = null
+                        if (index == 4 && tab != 4) settingsTab = tab
+                        tab = index
+                    },
+                        modifier = if (relatedPage) Modifier.background(MaterialTheme.colorScheme.primary.copy(alpha = 0.10f)) else if (tab != 4 && feasibleUnread > 0 && index == 5) Modifier.background(Color(0xFF2E7D32)) else if (tab != 4 && urgent) Modifier.background(MaterialTheme.colorScheme.tertiaryContainer) else Modifier,
+                        icon = { BadgedBox(badge = { if (urgent) Badge { Text(if (messageUnread > 99) "99+" else messageUnread.toString()) } }) { Text((index + 1).toString()) } },
+                        label = { Text(label, maxLines = 1, style = MaterialTheme.typography.labelSmall, fontWeight = if (relatedPage || urgent) FontWeight.Bold else FontWeight.Normal,
+                            color = if (relatedPage) MaterialTheme.colorScheme.primary else if (tab != 4 && feasibleUnread > 0 && index == 5) Color.White else Color.Unspecified) })
+                } }
+            }
         }) { padding -> Box(Modifier.padding(padding)) {
             when(tab) {
-                0 -> AiInputScreen(ai, onEdit = { placePick = null; editing = it }, onManual = { editing = localParse(ai.text) }, onSamples = {
+                0 -> AiInputScreen(ai, onSettings = { settingsTab = 0; tab = 4 }, onEdit = { placePick = null; editingActualMode = false; editing = it }, onManual = { editingActualMode = false; editing = localParse(ai.text) }, onSamples = {
                     val samples = sampleOrders()
                     update(rides + samples)
                     samples.forEach { FirebaseSyncManager.uploadRide(it) }
                     tab = 1
                 })
-                1 -> DailyScreen(rides, onEdit = { placePick = null; editing = it }, onUpdate = { order ->
+                1 -> DailyScreen(rides, initialRide = financeRide, onSettings = { settingsTab = 1; tab = 4 }, onEdit = { order, actual -> placePick = null; editingActualMode = actual; editing = order }, onUpdate = { order ->
                     update(rides.map { if (it.id == order.id) order else it })
                     FirebaseSyncManager.uploadRide(order)
                 }, onImport = { importedList ->
                     update(importedList)
                     importedList.forEach { FirebaseSyncManager.uploadRide(it) }
                 })
-                2 -> ExpenseScreen(rides)
-                4 -> MessageScreen(rides)
+                2 -> ExpenseScreen(rides, onOpenRide = { id ->
+                    rides.find { it.id == id }?.let { financeRide = it; tab = 1 }
+                }, onUpdateRides = { updated ->
+                    val changes = updated.filter { next -> rides.find { it.id == next.id } != next }
+                    rides = updated; store.save(updated)
+                    FirebaseSyncManager.uploadRidesAtomically(changes)
+                })
+                4 -> SettingsScreen(settingsTab, darkMode, onDarkMode = {
+                    darkMode = it
+                    preferences.edit().putBoolean("dark_mode", it).apply()
+                }, onSync = { showSyncDialog = true })
+                5 -> MessageScreen(rides, darkMode, onSettings = { settingsTab = 5; tab = 4 })
                 else -> MapScreen(rides, context, onSearch = { searchPlace("map") }, selectedPlace = placePick?.takeIf { it.target == "map" }?.label, darkMode = darkMode)
             }
-            editing?.let { order -> EditDialog(order, onDismiss = { editing = null }, onSave = { saved, partnerTime ->
-                val batch = ai.ordersToSave(saved).map { it.copy(needsAddressCheck = false, notes = reminders(it.notes, it.uncertainties), uncertainties = "", pickupTime = if(it.id != saved.id && partnerTime != null) partnerTime else it.pickupTime) }
+            editing?.let { order ->
+                val reportRules = remember(order.id) { runCatching { PassengerReportRulesStore(context).load() }.getOrDefault(PassengerReportRules()) }
+                EditDialog(order, defaultReportRules = reportRules, useDefaultReportTarget = rides.none { it.id == order.id }, showActualTimes = editingActualMode, onDismiss = { editing = null }, onSave = { saved, partnerTime ->
+                val batch = ai.ordersToSave(saved).map { draft ->
+                    val targeted = if (draft.id != saved.id && rides.none { it.id == draft.id }) reportRules.apply(draft) else draft
+                    targeted.copy(needsAddressCheck = false, notes = reminders(targeted.notes, targeted.uncertainties),
+                        uncertainties = "", pickupTime = if (targeted.id != saved.id && partnerTime != null) partnerTime else targeted.pickupTime)
+                }
                 update(rides.filterNot { existing -> batch.any { it.id == existing.id } } + batch)
                 batch.forEach {
                     FirebaseSyncManager.uploadRide(it)
@@ -329,7 +358,7 @@ private data class PlacePick(val target: String, val label: String, val placeId:
     }
     Text("接送排程（依日期／時間排列）", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(vertical = 6.dp))
     Text("車程及銜接待估算；時間排序不代表可行。", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
-    if (rides.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) { Text("尚無訂單，請從「新增 / 擷取」加入。") }
+    if (rides.isEmpty()) Box(Modifier.fillMaxSize(), contentAlignment = androidx.compose.ui.Alignment.Center) { Text("尚無訂單，請從「輸入」加入。") }
     else LazyColumn(contentPadding = PaddingValues(vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) { items(rides.sortedWith(compareBy<RideOrder> { bookingDate(it.date) }.thenBy { it.pickupTime.take(5) }), key = { it.id }) { order ->
         ElevatedCard(Modifier.fillMaxWidth()) { Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp), verticalArrangement = Arrangement.spacedBy(0.dp)) {
             Text("${bookingDate(order.date)}  ${order.pickupTime} · ${if (order.returnRide) "回程" else "去程"}${if(order.tentative) "（暫定）" else ""}", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
@@ -340,7 +369,7 @@ private data class PlacePick(val target: String, val label: String, val placeId:
             if (order.contactPhone.isBlank() && order.passengerPhone.isBlank()) Text("電話：未提供", style = MaterialTheme.typography.bodySmall)
             CopyableLine("上車", addressForDisplay(order.pickup), onNavigate = { launchNavigation(context, order.pickup) }) { copy("上車地址", addressForDisplay(order.pickup)) }
             CopyableLine("下車", addressForDisplay(order.destination), onNavigate = { launchNavigation(context, order.destination) }) { copy("下車地址", addressForDisplay(order.destination)) }
-            SelectableText("費用：${order.fare.ifBlank { "未提供" }}")
+            SelectableText("費用：${caseFeeText(order).ifBlank { "未填" }}")
             if(order.timeFlexible) Text("時間可調", style = MaterialTheme.typography.bodySmall)
             if(order.notes.isNotBlank()) Text(order.notes, style = MaterialTheme.typography.bodySmall)
             Row {
@@ -353,7 +382,7 @@ private data class PlacePick(val target: String, val label: String, val placeId:
 }
 
 internal fun launchNavigation(context: Context, rawAddress: String, placeId: String = "") {
-    val cleanAddress = addressForDisplay(rawAddress).replace(Regex("[（(].*?[）)]"), "").trim()
+    val cleanAddress = LocationTermsStore(context).load().expand(addressForDisplay(rawAddress)).replace(Regex("[（(].*?[）)]"), "").trim()
     if (cleanAddress.isBlank() || cleanAddress.contains("待確認") || cleanAddress.contains("待填")) {
         Toast.makeText(context, "地址待確認，無法開啟導航", Toast.LENGTH_SHORT).show()
         return
@@ -401,6 +430,9 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
 
 @Composable private fun EditDialog(
     order: RideOrder,
+    showActualTimes: Boolean = false,
+    defaultReportRules: PassengerReportRules = PassengerReportRules(),
+    useDefaultReportTarget: Boolean = false,
     onDismiss: () -> Unit,
     onSave: (RideOrder, String?) -> Unit,
     onSearchPlace: (String) -> Unit,
@@ -409,6 +441,8 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     onDelete: (() -> Unit)? = null
 ) {
     val context = androidx.compose.ui.platform.LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     val coroutineScope = rememberCoroutineScope()
     val routeClient = remember { GoogleRouteClient.create(context.applicationContext) }
 
@@ -428,7 +462,8 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     var contact by remember(order) { mutableStateOf(stripPlaceholder(order.contact.ifBlank { order.customer })) }
     var contactPhone by remember(order) { mutableStateOf(stripPlaceholder(order.contactPhone.ifBlank { order.passengerPhone })) }
     var passengerPhone by remember(order) { mutableStateOf(stripPlaceholder(order.passengerPhone)) }
-    var bookingId by remember(order) { mutableStateOf(order.bookingId) }
+    var actualBoardedAt by remember(order) { mutableStateOf(actualTimeEditValue(order.actualBoardedAt)) }
+    var actualAlightedAt by remember(order) { mutableStateOf(actualTimeEditValue(order.actualAlightedAt)) }
 
     // 2. 上車地址 & 3. 下車地址
     var pickup by remember(order) { mutableStateOf(stripPlaceholder(addressForDisplay(order.pickup))) }
@@ -461,24 +496,26 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     // 6. 費用與款項
     var fare by remember(order) { mutableStateOf(order.fare) }
     var received by remember(order) { mutableStateOf(order.received) }
+    var amountDue by remember(order) { mutableStateOf(if (order.receiptsManaged) order.amountDue else if (order.category != "日照") order.received else "") }
+    var monthlyReceipts by remember(order) { mutableStateOf(order.monthlyReceipts.filter { it.kind in listOf(SUBSIDY_RECEIPT, DAYCARE_RECEIPT) }) }
     var tip by remember(order) { mutableStateOf(order.tip) }
     var subsidyDue by remember(order) { mutableStateOf(order.subsidyDue) }
+    var daycareMonthly by remember(order) { mutableStateOf(order.daycareMonthly) }
+    var reportTarget by remember(order) { mutableStateOf(order.reportTarget.ifBlank { if (useDefaultReportTarget) defaultReportRules.target(customer) else "" }) }
+    var autoReportTarget by remember(order) { mutableStateOf(if (useDefaultReportTarget && order.reportTarget.isBlank()) defaultReportRules.target(customer) else null) }
+    LaunchedEffect(customer) {
+        if (useDefaultReportTarget && (reportTarget.isBlank() || reportTarget == autoReportTarget)) {
+            val matched = defaultReportRules.target(customer)
+            reportTarget = matched
+            autoReportTarget = matched
+        }
+    }
 
     // 7. 備註與補充
     var notes by remember(order) { mutableStateOf(stripPlaceholder(order.notes)) }
     var uncertainties by remember(order) { mutableStateOf(order.uncertainties) }
     var calendarTime by remember(order) { mutableStateOf(order.calendarTime) }
     var rawText by remember(order) { mutableStateOf(order.raw) }
-
-    fun autoCalculateSubsidy(recvStr: String, cat: String) {
-        if (cat in listOf("補助", "補助單")) {
-            val r = recvStr.toDoubleOrNull()
-            if (r != null && r > 0) {
-                fare = kotlin.math.ceil(r * 3.3).toInt().toString()
-                subsidyDue = kotlin.math.ceil(r * 2.3).toInt().toString()
-            }
-        }
-    }
 
     // 根據地址自動估算車程
     fun autoEstimate(from: String, to: String, fromId: String = "", toId: String = "") {
@@ -530,11 +567,11 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
 
     fun performSave() {
         val issues = mutableListOf<String>()
-        val singleTimeMatch = Regex("^([01]?\\d|2[0-3]):([0-5]\\d)$").find(pickupTime.trim())
+        val formattedPickupTime = normalizeTime(pickupTime)
         val isRange = pickupTime.contains("-") || pickupTime.contains("–") || pickupTime.contains("~")
         if (pickupTime.isBlank()) {
             issues += "請填寫接客時間"
-        } else if (isRange || singleTimeMatch == null) {
+        } else if (isRange || formattedPickupTime == null) {
             issues += "接客時間請填寫單一時間（例如 09:30），不可為範圍"
         }
         val cleanDate = fullRideDate(serviceDate.trim())
@@ -547,27 +584,34 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
         if (received.isNotBlank() && !Regex("\\d{1,9}(?:\\.\\d{1,2})?").matches(received.trim())) issues += "實收金額請填非負數字"
         if (tip.isNotBlank() && !Regex("\\d{1,9}(?:\\.\\d{1,2})?").matches(tip.trim())) issues += "小費請填非負數字"
         if (subsidyDue.isNotBlank() && !Regex("\\d{1,9}(?:\\.\\d{1,2})?").matches(subsidyDue.trim())) issues += "待收補助請填非負數字"
+        if (daycareMonthly.isNotBlank() && !Regex("\\d{1,9}(?:\\.\\d{1,2})?").matches(daycareMonthly.trim())) issues += "月結-日照請填非負數字"
         if (rideMinutes.isNotBlank() && (rideMinutes.toIntOrNull() == null || rideMinutes.toInt() !in 0..1440)) issues += "車程請填 0 到 1440 分鐘"
         if (transferMinutes.isNotBlank() && (transferMinutes.toIntOrNull() == null || transferMinutes.toInt() !in 0..1440)) issues += "交通車程請填 0 到 1440 分鐘"
+        val boarded = parseActualTimeInput(actualBoardedAt, cleanDate)
+        val alighted = parseActualTimeInput(actualAlightedAt, cleanDate)
+        if (boarded == null || alighted == null) issues += "實際上下車時間請填 HH:mm 或 HHmm，或留空"
+        val boardedInstant = boarded?.takeIf { it.isNotBlank() }?.let { actualRideInstant(it, cleanDate) }
+        val alightedInstant = alighted?.takeIf { it.isNotBlank() }?.let { actualRideInstant(it, cleanDate) }
+        if (boardedInstant != null && alightedInstant != null && alightedInstant.isBefore(boardedInstant)) issues += "客下時間不可早於客上時間"
 
+        issues += rideMoneyValidation(order.copy(amountDue = amountDue.trim(), receiptsManaged = true, received = amountDue.trim(), tip = tip.trim(),
+            subsidyDue = if (category in subsidyCategories) subsidyDue.trim() else "", daycareMonthly = if (category == "日照") daycareMonthly.trim() else "", monthlyReceipts = monthlyReceipts))
         if (issues.isNotEmpty()) {
             validationMessage = issues.joinToString("\n")
         } else {
-            val formattedPickupTime = "%02d:%02d".format(
-                singleTimeMatch!!.groupValues[1].toInt(),
-                singleTimeMatch.groupValues[2].toInt()
-            )
             val addressChanged = formattedPickupTime != order.pickupTime || pickup != order.pickup || destination != order.destination || pickupPlaceId != order.pickupPlaceId || destinationPlaceId != order.destinationPlaceId
             val saved = order.copy(
                 date = cleanDate,
                 serviceDate = cleanDate,
-                pickupTime = formattedPickupTime,
+                pickupTime = formattedPickupTime!!,
                 timeFlexible = timeFlexible,
                 customer = customer.trim(),
                 contact = contact.trim().ifBlank { customer.trim() },
                 contactPhone = contactPhone.trim(),
                 passengerPhone = passengerPhone.trim().ifBlank { contactPhone.trim() },
-                bookingId = bookingId.trim(),
+                bookingId = order.bookingId,
+                actualBoardedAt = boarded ?: order.actualBoardedAt,
+                actualAlightedAt = alighted ?: order.actualAlightedAt,
                 pickup = pickup.trim(),
                 destination = destination.trim(),
                 pickupPlaceId = pickupPlaceId,
@@ -578,9 +622,13 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                 tentative = tentative,
                 completed = completed,
                 fare = fare.trim(),
-                received = received.trim(),
+                amountDue = amountDue.trim(), receiptsManaged = true,
+                received = amountDue.trim(),
+                monthlyReceipts = monthlyReceipts,
                 tip = tip.trim(),
-                subsidyDue = subsidyDue.trim(),
+                daycareMonthly = if (category == "日照") daycareMonthly.trim() else "",
+                reportTarget = reportTarget.trim(),
+                subsidyDue = if (category in subsidyCategories) subsidyDue.trim() else "",
                 rideMinutes = rideMinutes.trim(),
                 transferMinutes = transferMinutes.trim(),
                 notes = notes.trim(),
@@ -594,13 +642,11 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
         }
     }
 
-    val focusManager = LocalFocusManager.current
-
     fun performDuplicate() {
         val issues = mutableListOf<String>()
-        val singleTimeMatch = Regex("^([01]?\\d|2[0-3]):([0-5]\\d)$").find(pickupTime.trim())
+        val formattedPickupTime = normalizeTime(pickupTime)
         val isRange = pickupTime.contains("-") || pickupTime.contains("–") || pickupTime.contains("~")
-        if (pickupTime.isBlank() || isRange || singleTimeMatch == null) issues += "請填寫有效單一接客時間"
+        if (pickupTime.isBlank() || isRange || formattedPickupTime == null) issues += "請填寫有效單一接客時間"
         if (customer.isBlank()) issues += "請填寫乘客姓名"
         val cleanDate = fullRideDate(serviceDate.trim())
         if (serviceDate.isNotBlank() && runCatching { java.time.LocalDate.parse(cleanDate) }.isFailure) {
@@ -609,18 +655,17 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
         if (issues.isNotEmpty()) {
             validationMessage = issues.joinToString("\n")
         } else {
-            val formattedPickupTime = "%02d:%02d".format(singleTimeMatch!!.groupValues[1].toInt(), singleTimeMatch.groupValues[2].toInt())
             val duplicate = order.copy(
                 id = System.nanoTime(),
                 date = cleanDate,
                 serviceDate = cleanDate,
-                pickupTime = formattedPickupTime,
+                pickupTime = formattedPickupTime!!,
                 timeFlexible = timeFlexible,
                 customer = customer.trim(),
                 contact = contact.trim().ifBlank { customer.trim() },
                 contactPhone = contactPhone.trim(),
                 passengerPhone = passengerPhone.trim().ifBlank { contactPhone.trim() },
-                bookingId = bookingId.trim(),
+                bookingId = order.bookingId,
                 pickup = pickup.trim(),
                 destination = destination.trim(),
                 pickupPlaceId = pickupPlaceId,
@@ -630,10 +675,15 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                 wheelchair = wheelchair,
                 tentative = tentative,
                 completed = false,
+                actualBoardedAt = "",
+                actualAlightedAt = "",
                 fare = fare.trim(),
-                received = received.trim(),
-                tip = tip.trim(),
-                subsidyDue = subsidyDue.trim(),
+                received = "",
+                monthlyReceipts = emptyList(), receiptsManaged = true, amountDue = amountDue.trim(),
+                tip = "",
+                daycareMonthly = if (category == "日照") daycareMonthly.trim() else "",
+                reportTarget = reportTarget.trim().ifBlank { defaultReportRules.target(customer) },
+                subsidyDue = if (category in subsidyCategories) subsidyDue.trim() else "",
                 rideMinutes = rideMinutes.trim(),
                 transferMinutes = transferMinutes.trim(),
                 notes = notes.trim(),
@@ -736,7 +786,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                 item {
                     val eta = calculateEta(pickupTime, rideMinutes.toLongOrNull())
                     val isRange = pickupTime.contains("-") || pickupTime.contains("–") || pickupTime.contains("~")
-                    val isInvalid = pickupTime.isNotBlank() && (isRange || !Regex("^([01]?\\d|2[0-3]):[0-5]\\d$").matches(pickupTime.trim()))
+                    val isInvalid = pickupTime.isNotBlank() && (isRange || normalizeTime(pickupTime) == null)
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -818,6 +868,23 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                     }
                 }
 
+                if (showActualTimes) item {
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("實際上下車時間", style = MaterialTheme.typography.titleSmall)
+                        OutlinedTextField(actualBoardedAt, { if (it.all { char -> char.isDigit() || char == ':' }) actualBoardedAt = it },
+                            label = { Text("客上時間") }, placeholder = { Text("HH:mm 或 HHmm") },
+                            singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
+                            modifier = Modifier.fillMaxWidth())
+                        OutlinedTextField(actualAlightedAt, { if (it.all { char -> char.isDigit() || char == ':' }) actualAlightedAt = it },
+                            label = { Text("客下時間") }, placeholder = { Text("HH:mm 或 HHmm") },
+                            singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
+                            modifier = Modifier.fillMaxWidth())
+                        Text("留空表示尚未記錄；客下不得早於客上。", style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+
                 // 1. 乘客與聯絡人姓名
                 item {
                     Row(
@@ -868,18 +935,6 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                     }
                 }
 
-                // 3. 預約單號 / 訂單編號
-                item {
-                    OutlinedTextField(
-                        value = bookingId,
-                        onValueChange = { bookingId = it },
-                        label = { Text("訂單編號 / 預約單號 (bookingId)") },
-                        placeholder = { Text("選填，例如長照派單代號") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
-
                 // 4. Case 類型 | 行程方向 | 輪椅需求
                 item {
                     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -907,8 +962,13 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                             selected = isSelected,
                                             onClick = {
                                                 val targetCat = if (label == "補助") "補助單" else label
-                                                category = targetCat
-                                                autoCalculateSubsidy(received, targetCat)
+                                                val next = changeRideIncomeType(order.copy(
+                                                    subsidyDue = subsidyDue, daycareMonthly = daycareMonthly,
+                                                    monthlyReceipts = monthlyReceipts), targetCat)
+                                                category = next.category
+                                                subsidyDue = next.subsidyDue
+                                                daycareMonthly = next.daycareMonthly
+                                                monthlyReceipts = next.monthlyReceipts
                                             },
                                             label = { Text(label, style = MaterialTheme.typography.labelSmall) },
                                             modifier = Modifier.height(34.dp)
@@ -996,6 +1056,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             )
+                            LocationTermComment(pickup)
                             OutlinedTextField(
                                 value = destination,
                                 onValueChange = { destination = it; destinationPlaceId = "" },
@@ -1007,6 +1068,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             )
+                            LocationTermComment(destination)
                         }
                         IconButton(
                             onClick = {
@@ -1032,7 +1094,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                     }
                 }
 
-                // 6. 本趟車程 (壓縮欄位)、實收金額 與 小費/TIP
+                // 6. 本趟車程與交通銜接
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1041,7 +1103,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                     ) {
                         OutlinedTextField(
                             value = rideMinutes,
-                            onValueChange = { rideMinutes = it },
+                            onValueChange = { if (it.all(Char::isDigit)) rideMinutes = it },
                             label = { Text("本趟車程") },
                             suffix = { Text("分") },
                             placeholder = { Text(if (isEstimatingRoute) "…" else "分") },
@@ -1058,38 +1120,28 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                     }
                                 }
                             },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.weight(0.9f)
-                        )
-                        OutlinedTextField(
-                            value = received,
-                            onValueChange = { input ->
-                                if (input.all { it.isDigit() }) {
-                                    received = input
-                                    autoCalculateSubsidy(input, category)
-                                }
-                            },
-                            label = { Text("實收金額") },
-                            suffix = { Text("元") },
                             singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
                             modifier = Modifier.weight(1f)
                         )
                         OutlinedTextField(
-                            value = tip,
-                            onValueChange = { input ->
-                                if (input.all { it.isDigit() }) tip = input
-                            },
-                            label = { Text("小費/TIP") },
-                            suffix = { Text("元") },
+                            value = transferMinutes,
+                            onValueChange = { if (it.all(Char::isDigit)) transferMinutes = it },
+                            label = { Text("交通銜接") },
+                            suffix = { Text("分") },
                             singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
-                            modifier = Modifier.weight(0.9f)
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
+                            modifier = Modifier.weight(1f)
                         )
                     }
                 }
 
-                // 7. 交通銜接、待收補助 與 報價/費用
+                // 7. 各類型款項
+                item {
+                    Text("乘客付款填實際收到的總金額（含小費）。小費僅供紀錄，不會另外列入收支計算；只有月結需要登記收款。", style = MaterialTheme.typography.bodySmall)
+                }
                 item {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1097,41 +1149,62 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         OutlinedTextField(
-                            value = transferMinutes,
-                            onValueChange = { transferMinutes = it },
-                            label = { Text("交通銜接") },
-                            suffix = { Text("分") },
-                            placeholder = { Text("上一趟") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.weight(0.9f)
-                        )
-                        OutlinedTextField(
-                            value = subsidyDue,
-                            onValueChange = { input ->
-                                if (input.all { it.isDigit() }) subsidyDue = input
-                            },
-                            label = { Text(if (category in listOf("補助", "補助單")) "待收補助 (自動)" else "待收補助") },
-                            suffix = { Text("元") },
+                            value = amountDue,
+                            onValueChange = { if (it.all { char -> char.isDigit() || char == '.' }) amountDue = it },
+                            label = { Text("乘客付款（元）") },
                             singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Next),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
                             modifier = Modifier.weight(1f)
                         )
                         OutlinedTextField(
-                            value = fare,
-                            onValueChange = { fare = it },
-                            label = { Text(if (category in listOf("補助", "補助單")) "報價/費用 (自動)" else "報價/費用") },
-                            suffix = { Text("元") },
+                            value = tip,
+                            onValueChange = { if (it.all { char -> char.isDigit() || char == '.' }) tip = it },
+                            label = { Text("小費", style = MaterialTheme.typography.labelSmall) },
                             singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number, imeAction = ImeAction.Done),
-                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus() }),
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (category in listOf("補助", "補助單")) OutlinedTextField(
+                            value = subsidyDue,
+                            onValueChange = { if (it.all { char -> char.isDigit() || char == '.' }) subsidyDue = it },
+                            label = { Text("月結-補助", style = MaterialTheme.typography.labelSmall) },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
+                            modifier = Modifier.weight(1f)
+                        )
+                        if (category == "日照") OutlinedTextField(
+                            value = daycareMonthly,
+                            onValueChange = { if (it.all { char -> char.isDigit() || char == '.' }) daycareMonthly = it },
+                            label = { Text("月結-日照") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                            keyboardActions = KeyboardActions(onDone = { focusManager.clearFocus(); keyboardController?.hide() }),
                             modifier = Modifier.weight(1f)
                         )
                     }
                 }
 
+                item { Text("小費僅供紀錄，已包含在乘客付款，不另計收支。", style = MaterialTheme.typography.labelSmall) }
+
                 // 8. 備註 與 待確認事項
                 item {
+                    if (category in subsidyCategories || category == "日照") MonthlyReceiptsEditor(order.copy(category = category, amountDue = amountDue, receiptsManaged = true,
+                        subsidyDue = subsidyDue, tip = tip, daycareMonthly = daycareMonthly, monthlyReceipts = monthlyReceipts),
+                        onChange = { monthlyReceipts = it })
+                }
+                item {
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedTextField(
+                            value = reportTarget,
+                            onValueChange = { reportTarget = it; autoReportTarget = null },
+                            label = { Text("客上／客下回報對象") },
+                            placeholder = { Text("留空使用一般設定") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
                         OutlinedTextField(
                             value = notes,
                             onValueChange = { notes = it },
@@ -1183,7 +1256,6 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                         value = calendarTime,
                                         onValueChange = { calendarTime = it },
                                         label = { Text("日曆原始時段 (calendarTime)") },
-                                        singleLine = true,
                                         modifier = Modifier.fillMaxWidth()
                                     )
                                     OutlinedTextField(
@@ -1191,7 +1263,6 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                                         onValueChange = { rawText = it },
                                         label = { Text("保留原文 (raw)") },
                                         minLines = 2,
-                                        maxLines = 4,
                                         modifier = Modifier.fillMaxWidth()
                                     )
                                     if (order.imageTranscript.isNotBlank()) {
@@ -1228,13 +1299,15 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     }
 
     if (confirmDelete && onDelete != null) {
+        val hasCollections = effectiveReceipts(order).isNotEmpty()
         AlertDialog(
             onDismissRequest = { confirmDelete = false },
             title = { Text("刪除此行程？") },
-            text = { Text("${order.serviceDate} ${order.pickupTime} · ${order.customer}\n確定要刪除此行程嗎？") },
+            text = { Text("${order.serviceDate} ${order.pickupTime} · ${order.customer}\n" + if (hasCollections)
+                "這趟已有收款。請先在費用頁撤銷批次收款，或在行程移除單筆收款並儲存，再刪除行程。" else "確定要刪除此行程嗎？") },
             confirmButton = {
-                TextButton(onClick = onDelete, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
-                    Text("刪除")
+                TextButton(onClick = { if (hasCollections) confirmDelete = false else onDelete() }, colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)) {
+                    Text(if (hasCollections) "返回" else "刪除")
                 }
             },
             dismissButton = {

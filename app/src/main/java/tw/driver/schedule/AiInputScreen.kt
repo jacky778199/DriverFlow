@@ -60,12 +60,14 @@ class AiInputViewModel : ViewModel() {
         }
     }
 
-    fun recognize() {
+    fun recognize(context: Context) {
         if (busy || drafts.isNotEmpty() || (text.isBlank() && imagePath == null)) return
         work = viewModelScope.launch {
             busy = true; error = null; status = "準備辨識…"
             try {
-                drafts = AiBookingParser.extract(text, imagePath) { message ->
+                val settings = withContext(Dispatchers.IO) { AiSettingsStore(context).load() }
+                val terms = withContext(Dispatchers.IO) { LocationTermsStore(context).load() }
+                drafts = AiBookingParser.extract(text, imagePath, settings, terms) { message ->
                     withContext(Dispatchers.Main) { status = message }
                 }
                 if (drafts.isEmpty()) error = "沒有找到可辨識的接送預約。請補上文字說明或更清楚的圖片。"
@@ -73,6 +75,7 @@ class AiInputViewModel : ViewModel() {
             catch (e: Exception) { error = when(e) {
                 is AiInputException -> e.message
                 is AiHttpException -> when(e.status) {
+                    400 -> "${e.message}：請檢查模型名稱、模型是否支援圖片及提示詞長度。"
                     401, 403 -> "${e.message}：請檢查該服務的 Key 與權限。"
                     402 -> "${e.message}：請檢查帳戶餘額。"
                     429 -> "${e.message}：用量或頻率已達上限。"
@@ -115,9 +118,17 @@ class AiInputViewModel : ViewModel() {
     bitmap?.let { Image(it.asImageBitmap(), "預約原始圖片（預覽）", Modifier.fillMaxWidth().heightIn(max = 300.dp)) }
 }
 
-@Composable fun AiInputScreen(vm: AiInputViewModel, onEdit: (RideOrder) -> Unit, onManual: () -> Unit, onSamples: () -> Unit) {
+@Composable fun AiInputScreen(vm: AiInputViewModel, onEdit: (RideOrder) -> Unit, onManual: () -> Unit, onSamples: () -> Unit, onSettings: () -> Unit) {
     val context = androidx.compose.ui.platform.LocalContext.current
     val clipboard = LocalClipboardManager.current
+    val aiAccess by produceState(false to "讀取 AI 設定中…") {
+        value = withContext(Dispatchers.IO) {
+            runCatching {
+                val settings = AiSettingsStore(context).load()
+                settings.ready to if (settings.ready) "使用 ${settings.provider.label} · ${settings.model(settings.provider)}" else "尚未設定 ${settings.provider.label} API key，請先到設定 → Tab 1 填寫並儲存。"
+            }.getOrDefault(false to "無法讀取 AI 設定，請到設定 → Tab 1 重新儲存。")
+        }
+    }
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) vm.importImage(context.applicationContext, uri)
     }
@@ -135,10 +146,10 @@ class AiInputViewModel : ViewModel() {
             SourceImage(path)
             TextButton(onClick = { vm.imagePath = null }, enabled = !vm.busy && vm.drafts.isEmpty()) { Text("移除此圖片") }
         } }
-        item { Text("按下辨識會傳送文字與圖片至 Gemini；暫時失敗時，若已設定 DeepSeek，會改傳至 DeepSeek。僅設定 DeepSeek 時直接使用它。每家服務最多等待 15 秒，兩家合計約 30 秒另加圖片處理時間。請比對原文，確認儲存後才加入排程。", style = MaterialTheme.typography.bodySmall) }
-        if (BuildConfig.GEMINI_API_KEY.isBlank() && BuildConfig.DEEPSEEK_API_KEY.isBlank()) item { Text("尚未設定 AI Key，請在 local.properties 加入 GEMINI_API_KEY 或 DEEPSEEK_API_KEY 並重新建置。", color = MaterialTheme.colorScheme.error) }
-        item { Text(if(BuildConfig.DEEPSEEK_API_KEY.isBlank()) "DeepSeek 備援：尚未設定" else "DeepSeek 備援：已設定", style = MaterialTheme.typography.bodySmall) }
-        item { Button(onClick = vm::recognize, enabled = !vm.busy && vm.drafts.isEmpty() && (vm.text.isNotBlank() || vm.imagePath != null) && (BuildConfig.GEMINI_API_KEY.isNotBlank() || BuildConfig.DEEPSEEK_API_KEY.isNotBlank()), modifier = Modifier.fillMaxWidth()) { Text(if(vm.busy) "正在處理…" else "傳送並使用 AI 辨識") } }
+        item { Text("按下辨識會將文字與圖片傳送至 Tab 1 所設定的 AI 供應商。每家服務最多等待 15 秒；啟用備援時最多約 30 秒另加圖片處理時間。請比對原文，確認儲存後才加入排程。", style = MaterialTheme.typography.bodySmall) }
+        item { Text(aiAccess.second, style = MaterialTheme.typography.bodySmall) }
+        item { TextButton(onClick = onSettings, enabled = !vm.busy) { Text("設定 AI 供應商、模型與 API key") } }
+        item { Button(onClick = { vm.recognize(context.applicationContext) }, enabled = aiAccess.first && !vm.busy && vm.drafts.isEmpty() && (vm.text.isNotBlank() || vm.imagePath != null), modifier = Modifier.fillMaxWidth()) { Text(if(vm.busy) "正在處理…" else "傳送並使用 AI 辨識") } }
         if(vm.busy) item { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(vm.status) }
         vm.error?.let { item { Text(it, color = MaterialTheme.colorScheme.error) } }
         if (vm.drafts.isNotEmpty()) item { Text("${vm.drafts.size} 筆待確認（尚未加入排程）") }
@@ -146,6 +157,7 @@ class AiInputViewModel : ViewModel() {
             ElevatedCard(Modifier.fillMaxWidth()) { Column(Modifier.padding(12.dp)) {
                 val summary = "${bookingDate(draft.date)} ${draft.pickupTime} · ${if(draft.returnRide) "回程" else "去程"}${if(draft.tentative) "（暫定）" else ""}\n乘客：${draft.customer}\n聯絡人：${draft.contact}\n${draft.pickup} → ${draft.destination}\n費用：${draft.fare.ifBlank { "未提供" }}\n${reminders(draft.notes, draft.uncertainties)}"
                 SelectableText(summary)
+                LocationTermComment("${draft.pickup}\n${draft.destination}")
                 if (draft.imageTranscript.isNotBlank()) SelectableText("辨識文字：\n${draft.imageTranscript}")
                 Row { TextButton(onClick = { onEdit(draft) }) { Text("確認／修改") }; TextButton(onClick = { vm.skipBooking(draft) }) { Text("略過此張") } }
                 TextButton(onClick = { clipboard.setText(AnnotatedString(summary + if(draft.imageTranscript.isNotBlank()) "\n${draft.imageTranscript}" else "")) }) { Text("複製辨識結果") }

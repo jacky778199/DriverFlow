@@ -42,4 +42,39 @@ class DailyRecordsTest {
         assertNull(calculateEta("09:30", null))
         assertNull(calculateEta("待確認", 25))
     }
+    @Test fun actualTimesCanBeEditedWithoutChangingThePlannedPickup() {
+        val boarded = parseActualTimeInput("0942", "2026-09-25")!!
+        val alighted = parseActualTimeInput("10:18", "2026-09-25")!!
+        assertEquals("09-25 09:42", boarded)
+        assertEquals("09:42", actualTimeEditValue(boarded))
+        assertEquals("09:42", actualTimeLabel(boarded))
+        assertEquals("10-01 09:42", parseActualTimeInput(actualTimeEditValue(boarded), "2026-10-01"))
+        assertEquals("", parseActualTimeInput(" ", "2026-09-25"))
+        assertNull(parseActualTimeInput("2560", "2026-09-25"))
+        assertNull(parseActualTimeInput("09:42", "2026-02-30"))
+        val saved = ride().copy(actualBoardedAt = boarded, actualAlightedAt = alighted, bookingId = "keep")
+        assertEquals("09:30", saved.pickupTime)
+        assertEquals(36L, actualRideMinutes(saved))
+        assertEquals(saved, importRecords(exportRecords(listOf(saved))).single())
+        val legacy = LocalDate.of(2026, 9, 25).atTime(9, 42).atZone(java.time.ZoneId.systemDefault()).toInstant()
+        assertEquals("09:42", actualTimeEditValue(legacy.toString()))
+        assertEquals(legacy, actualRideInstant(legacy.toString(), "2026-09-25"))
+    }
+    @Test fun acceptsThreeClockFormatsWithin24Hours() {
+        assertEquals("09:30", normalizeTime("09:30"))
+        assertEquals("09:30", normalizeTime("0930"))
+        assertEquals("09:30", normalizeTime("09：30"))
+        assertEquals("00:00", normalizeTime("0000"))
+        assertNull(normalizeTime("24:00"))
+        assertNull(normalizeTime("1260"))
+        assertNull(normalizeTime("09:30-10:00"))
+    }
+    @Test fun caseFeesAndReportSettingsSurviveBackup() {
+        val base = ride().copy(daycareMonthly="500", reportTarget="王先生")
+        assertEquals("月結-日照: 500元", caseFeeText(base))
+        assertEquals(base, importRecords(exportRecords(listOf(base))).single())
+        assertEquals("實收: 120.50元", caseFeeText(base.copy(category="自費")))
+        assertEquals("已收: 120.50元 · 小費: 20元 · 月結-補助: 80元",
+            caseFeeText(base.copy(category="補助單", tip="20", subsidyDue="80")))
+    }
 }
