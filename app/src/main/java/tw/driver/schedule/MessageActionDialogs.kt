@@ -130,7 +130,7 @@ internal data class SendDraft(val target: String, val text: String, val key: Str
 
 @Composable internal fun InsertionReplyDialog(message: LineMessage, result: InsertionResult?, parsed: InsertionCase?,
     source: String, rides: List<RideOrder>, onDismiss: () -> Unit) {
-    var minutes by remember { mutableStateOf(result?.arrival?.minutes?.toString().orEmpty()) }
+    var minutes by remember { mutableStateOf(result?.takeIf { it.level != InsertionLevel.UNKNOWN }?.arrival?.minutes?.toString().orEmpty()) }
     var address by remember { mutableStateOf(
         (result?.case?.originalPickup ?: parsed?.originalPickup).orEmpty()
             .takeIf { it.isNotBlank() && message.content.contains(it) } ?: FirstMessageAddress.local(message.content)) }
@@ -145,9 +145,9 @@ internal data class SendDraft(val target: String, val text: String, val key: Str
             Text("回覆：${message.chat.ifBlank { "缺少聊天室" }}", style = MaterialTheme.typography.bodySmall)
             if (result == null) Text("尚無計算時間，可自行填寫分鐘數。", style = MaterialTheme.typography.bodySmall)
             else {
-                Text("已帶入計算時間：${result.arrival.minutes} 分鐘", style = MaterialTheme.typography.bodySmall)
+                Text(if (result.level == InsertionLevel.UNKNOWN) "資料待確認，請自行填寫分鐘數。" else "已帶入計算時間：${result.arrival.minutes} 分鐘", style = MaterialTheme.typography.bodySmall)
                 if (!result.isFresh(rides)) Text("使用上次計算結果，可修改後送出。", style = MaterialTheme.typography.bodySmall)
-                if (!result.feasible) Text(result.summary, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                if (result.level != InsertionLevel.AVAILABLE) Text(result.summary, color = insertionColor(result.level), style = MaterialTheme.typography.bodySmall)
             }
             OutlinedTextField(minutes, { minutes = it; error = "" }, label = { Text("幾分鐘可到") }, singleLine = true,
                 keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(keyboardType = androidx.compose.ui.text.input.KeyboardType.Number), modifier = Modifier.fillMaxWidth())

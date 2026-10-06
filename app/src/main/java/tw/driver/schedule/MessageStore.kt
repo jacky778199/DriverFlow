@@ -119,6 +119,19 @@ class MessageStore private constructor(context: Context) : SQLiteOpenHelper(cont
         _keywords.value = list
         refresh()
     }
+    @Synchronized internal fun reloadSyncedRules() {
+        _keywords.value = prefs.getString("keywords", null)?.let { raw ->
+            val array = JSONArray(raw)
+            List(array.length()) { array.getString(it) }
+        } ?: MessageKeywords.defaults
+        _senderAlertRules.value = prefs.getString("sender_alert_rules", null)?.let { raw ->
+            val array = JSONArray(raw)
+            SenderAlertRules.validate(List(array.length()) { i -> array.getJSONObject(i).let {
+                SenderAlertRule(it.getString("chat"), it.getString("sender"))
+            } })
+        } ?: emptyList()
+        refresh()
+    }
     @Synchronized fun reserve(request: OutgoingMessage, retryId: String?): OutgoingMessage {
         require(source.isNotBlank() && request.source == source) { "連線來源已變更，請重新開啟操作" }
         val old = readableDatabase.rawQuery("SELECT * FROM outgoing WHERE source=? AND action_key=? ORDER BY created DESC,rowid DESC LIMIT 1", arrayOf(source, request.actionKey)).use { if (it.moveToFirst()) it.outgoingMessage() else null }

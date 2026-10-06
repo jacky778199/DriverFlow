@@ -54,9 +54,12 @@ private val pagesWithSettings = setOf(0, 1, 4, 5)
                         Text("深色模式")
                         Switch(checked = darkMode, onCheckedChange = onDarkMode)
                     }
-                    SettingsGroup("雲端同步", "登入帳號，將排程與花費同步到其他裝置。") {
+                    SettingsGroup("雲端同步", "登入同一帳號，自動同步排程、花費與 App 設定。") {
+                        Text("同步外觀、起點、回報對象、地點簡稱、提醒規則及 AI 模型／提示詞。API 金鑰、訊息連線憑證與手機通知權限需在各裝置設定。", style = MaterialTheme.typography.bodySmall)
                         val user by FirebaseSyncManager.currentUser.collectAsState()
+                        val settingsStatus by AppSettingsSync.status.collectAsState()
                         Text(user?.email ?: "尚未登入", style = MaterialTheme.typography.bodyMedium)
+                        Text(settingsStatus, style = MaterialTheme.typography.bodySmall)
                         OutlinedButton(onClick = onSync) { Text(if (user == null) "登入與同步設定" else "管理同步帳號") }
                     }
                     LocationTermsSettings()

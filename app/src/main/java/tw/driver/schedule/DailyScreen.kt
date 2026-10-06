@@ -138,6 +138,8 @@ import java.time.LocalDateTime
     val messageStore = remember { MessageStore.get(context) }
     val sentMessages by messageStore.outgoing.collectAsState()
     var reportTarget by remember { mutableStateOf(prefs.getString("passenger_report_target", "小明").orEmpty()) }
+    val settingsRevision by AppSettingsSync.revision.collectAsState()
+    LaunchedEffect(settingsRevision) { reportTarget = prefs.getString("passenger_report_target", "小明").orEmpty() }
     var showReportHistory by remember { mutableStateOf(false) }
     fun passengerReport(order: RideOrder, boarding: Boolean) {
         val timestamp = recordActualTime(order.serviceDate, java.time.LocalTime.now())

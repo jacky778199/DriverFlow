@@ -17,6 +17,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.AnnotatedString
@@ -246,13 +247,14 @@ import java.time.Instant
                     if (matched) {
                         val evaluation = evaluations[message.seq]
                         val valid = evaluation?.takeIf { it.isFresh(rides, Instant.ofEpochMilli(clock)) }
-                        val btnColor = valid?.let { if (it.feasible) FeasibleGreen else InfeasibleRed }
+                        val btnColor = valid?.let { insertionColor(it.level) }
                             ?: MaterialTheme.colorScheme.secondary
                         Button(
                             onClick = onAssess,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = btnColor,
-                                contentColor = if (valid != null) Color.White else MaterialTheme.colorScheme.onSecondary
+                                contentColor = if (valid != null) { if (btnColor.luminance() > 0.45f) Color.Black else Color.White }
+                                    else MaterialTheme.colorScheme.onSecondary
                             ),
                             contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
                         ) { Text("評估可行性", style = MaterialTheme.typography.labelSmall) }
@@ -283,17 +285,9 @@ import java.time.Instant
                 }
                 // 評估結果摘要
                 evaluation?.let {
-                    val resultColor = when {
-                        valid?.feasible == true -> if (isDark) Color(0xFF7ED99E) else FeasibleGreen
-                        valid?.feasible == false -> if (isDark) Color(0xFFFF7070) else InfeasibleRed
-                        else -> MaterialTheme.colorScheme.onSurfaceVariant
-                    }
-                    Text(
-                        if (valid == null) "評估已過期或排程已變更，請重新評估"
-                        else "${terms.expand(it.case.pickup)} → ${terms.expand(it.case.destination)}\n接客：${if (it.case.asap) "即時（以評估當下時間計算）" else it.case.time}\n${it.summary}",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = resultColor
-                    )
+                    if (valid == null) Text("評估已過期或排程已變更，請重新評估",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    else InsertionRouteTimeline(valid, terms, isDark)
                 }
             }
         }

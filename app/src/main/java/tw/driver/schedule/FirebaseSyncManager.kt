@@ -34,6 +34,7 @@ object FirebaseSyncManager {
     private var expensesListener: ListenerRegistration? = null
     private var workHoursListener: ListenerRegistration? = null
     private var rentalPlanListener: ListenerRegistration? = null
+    private var appSettingsSync: AccountSettingsSync? = null
 
     // 回呼介面（當雲端有變更時通知 UI 及本機儲存）
     var onRemoteRidesUpdated: ((remoteRides: List<RideOrder>, deletedIds: Set<Long>) -> Unit)? = null
@@ -143,6 +144,7 @@ object FirebaseSyncManager {
     private fun startListening(uid: String, context: Context) {
         stopListening()
         val userDoc = firestore.collection("users").document(uid)
+        appSettingsSync = AccountSettingsSync(context.applicationContext, uid, firestore).also { it.start() }
         val appContext = context.applicationContext
 
         // 1. 監聽排程訂單：收到雲端變更立即寫入本機 OrderStore
@@ -280,6 +282,8 @@ object FirebaseSyncManager {
     }
 
     private fun stopListening() {
+        appSettingsSync?.stop()
+        appSettingsSync = null
         ridesListener?.remove()
         ridesListener = null
         expensesListener?.remove()

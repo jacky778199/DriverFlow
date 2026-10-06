@@ -5,6 +5,33 @@ import org.junit.Test
 import java.time.LocalDate
 
 class FinanceChartsTest {
+    @Test fun pendingTypesAndAllDetailRowsReconcileIncludingLongDaysAndLaterPayments() {
+        val subsidy = (1L..20L).map { monthlyRide(it, "100.01") }
+        val daycare = ride(30, "0").copy(category = "日照", daycareMonthly = "200.50")
+        val future = monthlyRide(31, "999").copy(serviceDate = date.plusDays(1).toString())
+        val incomplete = monthlyRide(32, "999").copy(completed = false)
+        val records = subsidy + daycare + future + incomplete
+        val partial = allocateCollection(records, mapOf("1:subsidy" to 5000L, "30:daycare" to 5050L), date, "轉帳", "partial")
+        val paid = allocateCollection(partial, mapOf("2:subsidy" to 10001L), date.plusDays(1), "轉帳", "later")
+        val subsidyEntries = pendingChartEntries(paid, date, SUBSIDY_RECEIPT)
+        val daycareEntries = pendingChartEntries(paid, date, DAYCARE_RECEIPT)
+        val all = pendingChartEntries(paid, date)
+        assertEquals(2, all.size)
+        assertEquals(195020L, subsidyEntries.single().amount)
+        assertEquals(15000L, daycareEntries.single().amount)
+        assertEquals(210020L, all.sumOf { it.amount })
+        assertEquals(outstanding(paid, date).sumOf { it.remaining }, all.sumOf { it.amount })
+        assertEquals(20, subsidyEntries.single().details.count { it.startsWith("待收：") })
+        assertTrue(subsidyEntries.single().details.any { it.startsWith("乘客20 ·") })
+        assertTrue(subsidyEntries.single().details.contains("待收合計：1950.20 元"))
+        all.forEach { entry ->
+            val displayed = entry.details.filter { it.startsWith("待收：") }
+                .sumOf { cents(it.removePrefix("待收：").removeSuffix(" 元")) }
+            assertEquals(entry.amount, displayed)
+        }
+        assertEquals(185019L, pendingChartEntries(paid, date.plusDays(1), SUBSIDY_RECEIPT)
+            .first { it.name == date.toString() }.amount)
+    }
     @Test fun pendingStripGroupsByDateAndShowsAsOfBalances() {
         val records = listOf(monthlyRide(1, "100.50"), monthlyRide(2, "200").copy(serviceDate = "2026-10-03"),
             monthlyRide(3, "50"), monthlyRide(4, "999").copy(completed = false))

@@ -118,9 +118,18 @@ internal fun workCostEntries(expenses: List<ExpenseItem>, rental: MonthlyRentalP
 
 private data class ChartSelection(val entry: FinanceChartEntry, val total: Long, val background: Color, val foreground: Color)
 
-internal fun pendingChartEntries(rides: List<RideOrder>, date: LocalDate): List<FinanceChartEntry> =
-    outstanding(rides, date).groupBy { it.ride.serviceDate }.map { (serviceDate, items) ->
-        FinanceChartEntry("pending-$serviceDate", serviceDate, items.sumOf { it.remaining }, items.flatMap { item ->
+internal fun pendingChartEntries(rides: List<RideOrder>, date: LocalDate, kind: String? = null): List<FinanceChartEntry> =
+    outstanding(rides, date).filter { kind == null || it.kind == kind }
+        .groupBy { it.ride.serviceDate to it.kind }.map { (group, items) ->
+        val (serviceDate, receiptKind) = group
+        val due = items.sumOf { dueCents(it.ride, it.kind) }
+        val paid = items.sumOf { paidCents(it.ride, it.kind, date) }
+        val remaining = items.sumOf { it.remaining }
+        FinanceChartEntry("pending-$receiptKind-$serviceDate", serviceDate, remaining,
+            listOf("${if (receiptKind == SUBSIDY_RECEIPT) "月結-補助" else "月結-日照"} · $serviceDate",
+                "待收行程：${items.size} 趟", "應收合計：${yuan(due)} 元",
+                "截至 $date 已收合計：${yuan(paid)} 元", "待收合計：${yuan(remaining)} 元",
+                "下列待收金額加總等於本色塊金額；已收清行程不列入。") + items.flatMap { item ->
             listOf("${item.ride.customer.ifBlank { "未填姓名" }} · ${receiptKindLabel(item.kind)} · ${if (item.ride.returnRide) "回程" else "去程"} ${item.ride.pickupTime}",
                 "應收：${yuan(dueCents(item.ride, item.kind))} 元",
                 "已收：${yuan(paidCents(item.ride, item.kind, date))} 元", "待收：${yuan(item.remaining)} 元")
@@ -135,6 +144,7 @@ internal fun FinanceChartDialog(date: LocalDate, cash: Boolean, rides: List<Ride
     rental: MonthlyRentalPlan, onDismiss: () -> Unit, onUndo: (String) -> Unit,
     pending: Boolean = false, onOpenRide: (Long) -> Unit = {}) {
     var selected by remember(date, cash) { mutableStateOf<FinanceChartEntry?>(null) }
+    var selectedChart by remember(date, cash) { mutableStateOf<ChartSelection?>(null) }
     var preview by remember(date, cash) { mutableStateOf<ChartSelection?>(null) }
     var pinned by remember(date, cash) { mutableStateOf<ChartSelection?>(null) }
     val latestPinned by rememberUpdatedState(pinned)
@@ -171,7 +181,7 @@ internal fun FinanceChartDialog(date: LocalDate, cash: Boolean, rides: List<Ride
                     Text(if (pending) "尚未收款明細" else if (cash) "收付款明細" else "工作成果明細", style = MaterialTheme.typography.titleLarge)
                     if (cash) Icon(Icons.Default.Payments, contentDescription = "現金流", modifier = Modifier.size(22.dp))
                 }
-                Text(if (cash) "$date · 點選項目查看細節" else "$date · 點一下固定，再點關閉；長按滑動查看", style = MaterialTheme.typography.bodySmall)
+                Text(if (pending) "截至 $date · 點一下查看完整明細；長按滑動預覽" else if (cash) "$date · 點選項目查看細節" else "$date · 點一下固定，再點關閉；長按滑動查看", style = MaterialTheme.typography.bodySmall)
                 if (cash) {
                     val maximum = maxOf(income.sumOf { it.amount }, outgoing.sumOf { it.amount }, 1L)
                     Row(Modifier.weight(1f), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
@@ -182,11 +192,25 @@ internal fun FinanceChartDialog(date: LocalDate, cash: Boolean, rides: List<Ride
                 } else {
                     val total = income.sumOf { it.amount }
                     LazyColumn(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        if (income.isNotEmpty()) item {
+                        if (pending) {
+                            item { Text("待收總額 ${yuan(total)} 元", style = MaterialTheme.typography.titleMedium) }
+                            listOf(SUBSIDY_RECEIPT to "月結-補助", DAYCARE_RECEIPT to "月結-日照").forEach { (kind, label) ->
+                                val entries = pendingChartEntries(rides, date, kind)
+                                item {
+                                    HorizontalDivider()
+                                    Text("$label · ${yuan(entries.sumOf { it.amount })} 元", style = MaterialTheme.typography.titleMedium)
+                                    if (entries.isEmpty()) Text("目前沒有待收款", style = MaterialTheme.typography.bodySmall)
+                                    else RevenueStrip(entries, colors, foregrounds,
+                                        onPreview = { preview = selection(it, entries) },
+                                        onSelect = { selectedChart = selection(it, entries); selected = it })
+                                }
+                            }
+                        }
+                        if (!pending && income.isNotEmpty()) item {
                             Text("${if (pending) "待收" else "營收"} ${yuan(total)} 元", style = MaterialTheme.typography.titleMedium)
                             RevenueStrip(income, colors, foregrounds, onPreview = { preview = selection(it, income) }, onSelect = { pinned = selection(it, income) })
                         }
-                        if (income.isEmpty()) item { Text(if (pending) "目前沒有待收款" else "當天沒有非零營收") }
+                        if (!pending && income.isEmpty()) item { Text("當天沒有非零營收") }
                         if (!pending && costs.isNotEmpty()) item {
                             HorizontalDivider()
                             Text("成本 ${yuan(costs.sumOf { it.amount })} 元", style = MaterialTheme.typography.titleMedium)
@@ -212,6 +236,9 @@ internal fun FinanceChartDialog(date: LocalDate, cash: Boolean, rides: List<Ride
     }
     selected?.let { entry ->
         AlertDialog(onDismissRequest = { selected = null }, title = { Text("${entry.name} · ${yuan(entry.amount)} 元") },
+            containerColor = if (pending) selectedChart?.background ?: MaterialTheme.colorScheme.surface else MaterialTheme.colorScheme.surface,
+            titleContentColor = if (pending) selectedChart?.foreground ?: MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface,
+            textContentColor = if (pending) selectedChart?.foreground ?: MaterialTheme.colorScheme.onSurface else MaterialTheme.colorScheme.onSurface,
             text = { LazyColumn(Modifier.heightIn(max = 420.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 item { DetailLines(entry.details) }
                 itemsIndexed(entry.rideIds) { _, rideId ->
@@ -234,7 +261,7 @@ private fun DetailLines(lines: List<String>) {
         lines.forEachIndexed { index, line ->
             val heading = line.startsWith("去程") || line.startsWith("回程") ||
                 (line.contains(" · ") && !line.contains("："))
-            val total = line.startsWith("合併") || line.startsWith("實收合計") || line.startsWith("這趟營收")
+            val total = line.startsWith("合併") || line.startsWith("實收合計") || line.startsWith("這趟營收") || line.startsWith("待收合計")
             if (index > 0 && (heading || total)) HorizontalDivider(color = LocalContentColor.current.copy(alpha = 0.25f))
             Text(line, modifier = Modifier.padding(start = if (heading || total) 0.dp else 12.dp),
                 style = if (heading || total) MaterialTheme.typography.titleSmall else MaterialTheme.typography.bodySmall)

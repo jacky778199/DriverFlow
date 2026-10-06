@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -205,6 +206,8 @@ private data class PlacePick(val target: String, val label: String, val placeId:
     val store = remember { OrderStore(context) }
     val preferences = remember { context.getSharedPreferences("appearance", Context.MODE_PRIVATE) }
     var darkMode by remember { mutableStateOf(preferences.getBoolean("dark_mode", false)) }
+    val settingsRevision by AppSettingsSync.revision.collectAsState()
+    LaunchedEffect(settingsRevision) { darkMode = preferences.getBoolean("dark_mode", false) }
     SideEffect {
         (context as? android.app.Activity)?.window?.let { window ->
             WindowCompat.getInsetsController(window, window.decorView).apply {
@@ -315,16 +318,18 @@ private data class PlacePick(val target: String, val label: String, val placeId:
                     rides = updated; store.save(updated)
                     FirebaseSyncManager.uploadRidesAtomically(changes)
                 })
-                4 -> SettingsScreen(settingsTab, darkMode, onDarkMode = {
+                4 -> key(settingsRevision) { SettingsScreen(settingsTab, darkMode, onDarkMode = {
                     darkMode = it
                     preferences.edit().putBoolean("dark_mode", it).apply()
-                }, onSync = { showSyncDialog = true })
+                }, onSync = { showSyncDialog = true }) }
                 5 -> MessageScreen(rides, darkMode, onSettings = { settingsTab = 5; tab = 4 })
                 else -> MapScreen(rides, context, onSearch = { searchPlace("map") }, selectedPlace = placePick?.takeIf { it.target == "map" }?.label, darkMode = darkMode)
             }
             editing?.let { order ->
-                val reportRules = remember(order.id) { runCatching { PassengerReportRulesStore(context).load() }.getOrDefault(PassengerReportRules()) }
-                EditDialog(order, defaultReportRules = reportRules, useDefaultReportTarget = rides.none { it.id == order.id }, showActualTimes = editingActualMode, onDismiss = { editing = null }, onSave = { saved, partnerTime ->
+                val reportRules = remember(order.id, settingsRevision) { runCatching { PassengerReportRulesStore(context).load() }.getOrDefault(PassengerReportRules()) }
+                EditDialog(order, defaultReportRules = reportRules,
+                    historicalReportTargets = rides.sortedWith(compareByDescending<RideOrder> { it.serviceDate }.thenByDescending { it.pickupTime }).map { it.reportTarget },
+                    useDefaultReportTarget = rides.none { it.id == order.id }, showActualTimes = editingActualMode, onDismiss = { editing = null }, onSave = { saved, partnerTime ->
                 val batch = ai.ordersToSave(saved).map { draft ->
                     val targeted = if (draft.id != saved.id && rides.none { it.id == draft.id }) reportRules.apply(draft) else draft
                     targeted.copy(needsAddressCheck = false, notes = reminders(targeted.notes, targeted.uncertainties),
@@ -432,6 +437,7 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     order: RideOrder,
     showActualTimes: Boolean = false,
     defaultReportRules: PassengerReportRules = PassengerReportRules(),
+    historicalReportTargets: List<String> = emptyList(),
     useDefaultReportTarget: Boolean = false,
     onDismiss: () -> Unit,
     onSave: (RideOrder, String?) -> Unit,
@@ -503,6 +509,21 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
     var daycareMonthly by remember(order) { mutableStateOf(order.daycareMonthly) }
     var reportTarget by remember(order) { mutableStateOf(order.reportTarget.ifBlank { if (useDefaultReportTarget) defaultReportRules.target(customer) else "" }) }
     var autoReportTarget by remember(order) { mutableStateOf(if (useDefaultReportTarget && order.reportTarget.isBlank()) defaultReportRules.target(customer) else null) }
+    var showReportTargets by remember(order) { mutableStateOf(false) }
+    val reportSuggestions = reportTargetSuggestions(defaultReportRules, historicalReportTargets)
+    if (showReportTargets) AlertDialog(onDismissRequest = { showReportTargets = false },
+        title = { Text("選擇客上／客下回報群組") },
+        text = { LazyColumn(Modifier.heightIn(max = 420.dp)) {
+            if (reportSuggestions.isEmpty()) item { Text("尚無固定乘客或歷史回報對象，可直接在欄位輸入。") }
+            reportSuggestions.groupBy { it.fixed }.forEach { (fixed, suggestions) ->
+                item { Text(if (fixed) "固定乘客的回報對象" else "歷史回報對象", style = MaterialTheme.typography.titleSmall) }
+                items(suggestions) { suggestion ->
+                    TextButton(onClick = { reportTarget = suggestion.target; autoReportTarget = null; showReportTargets = false }, modifier = Modifier.fillMaxWidth()) {
+                        Text(suggestion.label)
+                    }
+                }
+            }
+        } }, confirmButton = { TextButton(onClick = { showReportTargets = false }) { Text("取消") } })
     LaunchedEffect(customer) {
         if (useDefaultReportTarget && (reportTarget.isBlank() || reportTarget == autoReportTarget)) {
             val matched = defaultReportRules.target(customer)
@@ -1202,6 +1223,9 @@ internal fun launchNavigation(context: Context, rawAddress: String, placeId: Str
                             onValueChange = { reportTarget = it; autoReportTarget = null },
                             label = { Text("客上／客下回報對象") },
                             placeholder = { Text("留空使用一般設定") },
+                            trailingIcon = if (reportTarget.isBlank()) ({ IconButton(onClick = { showReportTargets = true }) {
+                                Icon(Icons.Default.List, contentDescription = "快速選擇回報群組")
+                            } }) else null,
                             singleLine = true,
                             modifier = Modifier.fillMaxWidth()
                         )

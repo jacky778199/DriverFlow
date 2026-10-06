@@ -11,6 +11,26 @@ import java.time.ZoneId
 import java.io.IOException
 
 class RouteEstimatorTest {
+    @Test fun streetOnlyRecognizesSectionsAndLanesButNotFullAddressesOrHospitals() {
+        assertTrue(isStreetOnlyAddress("台北市中山北路二段"))
+        assertTrue(isStreetOnlyAddress("民生東路三段20巷附近"))
+        assertTrue(isStreetOnlyAddress("信義路"))
+        assertFalse(isStreetOnlyAddress("信義路100號"))
+        assertFalse(isStreetOnlyAddress("台大醫院"))
+    }
+    @Test fun roughStreetSelectsRepresentativeWithoutPromptAndKeepsExactCacheSeparate() = runBlocking {
+        MockWebServer().use { server ->
+            val response = """{"places":[{"id":"a","displayName":{"text":"信義路"},"formattedAddress":"台北市信義路"},{"id":"b","displayName":{"text":"信義路"},"formattedAddress":"新北市信義路"}]}"""
+            server.enqueue(MockResponse().setBody(response))
+            server.enqueue(MockResponse().setBody(response))
+            val client = GoogleRouteClient("test-key", placesUrl = server.url("/places").toString())
+            val rough = client.resolve("台北市信義路", "", { _, _ -> error("rough street must not prompt") }, true)
+            assertEquals("a", rough.id)
+            val exact = client.resolve("台北市信義路", "") { _, places -> places[1] }
+            assertEquals("b", exact.id)
+            assertEquals(2, server.requestCount)
+        }
+    }
     private fun ride() = RideOrder(id=1, date="2026/09/25", pickupTime="09:00", pickup="甲", destination="乙")
     @Test fun departureUsesPickupBufferOrCurrentTraffic() {
         val zone=ZoneId.of("Asia/Taipei")

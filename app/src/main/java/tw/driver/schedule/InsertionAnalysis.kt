@@ -55,13 +55,13 @@ internal object InsertionAnalysis {
                     save(source, message.seq, entry)
                     val evaluator = InsertionEvaluator(GoogleRouteClient.create(context),
                         { query, _ -> error("「$query」有多個地點，請開啟評估選擇") },
-                        { currentMessageLocation(context) },
+                        { currentMessageLocation(context).let { RoutePoint(it.latitude, it.longitude, it.accuracy.toInt()) } },
                         { progress -> save(source, message.seq, entry.copy(status = progress)) })
                     val rides = OrderStore(context).load()
                     val result = evaluator.evaluate(parsed, rides, { OrderStore(context).load() })
                     entry = entry.copy(result = result, status = "自動評估完成")
                 } catch (e: CancellationException) { throw e }
-                catch (e: Exception) { entry = entry.copy(status = "自動評估失敗：${e.message ?: "請開啟評估補齊資料"}") }
+                catch (e: Exception) { entry = entry.copy(status = "尚無法判斷：${e.message ?: "請開啟評估補齊資料"}") }
                 save(source, message.seq, entry)
                 entry
             }

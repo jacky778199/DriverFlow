@@ -6,6 +6,13 @@ import org.json.JSONObject
 import java.util.Locale
 
 internal data class PassengerReportRule(val customer: String, val target: String)
+internal data class ReportTargetSuggestion(val label: String, val target: String, val fixed: Boolean)
+internal fun reportTargetSuggestions(rules: PassengerReportRules, history: List<String>): List<ReportTargetSuggestion> {
+    val seen = mutableSetOf<String>()
+    return (rules.items.map { ReportTargetSuggestion("${it.customer} · ${it.target.trim()}", it.target.trim(), true) } +
+        history.map { ReportTargetSuggestion(it.trim(), it.trim(), false) })
+        .filter { it.target.isNotBlank() && seen.add(passengerNameKey(it.target)) }
+}
 internal fun passengerNameKey(value: String) = value.trim().replace(Regex("\\s+"), " ").lowercase(Locale.ROOT)
 internal class PassengerReportRules(val items: List<PassengerReportRule> = emptyList()) {
     fun validate() {

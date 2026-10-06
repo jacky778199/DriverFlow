@@ -13,7 +13,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-internal class AiSettingsStore(context: Context) {
+internal class AiSettingsStore(private val context: Context) {
     private val file = AtomicFile(File(context.noBackupFilesDir, "ai-settings"))
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
@@ -40,6 +40,7 @@ internal class AiSettingsStore(context: Context) {
         val bytes = cipher.iv + cipher.doFinal(json.toString().toByteArray(Charsets.UTF_8))
         val stream = file.startWrite()
         try { stream.write(bytes); file.finishWrite(stream) } catch (e: Exception) { file.failWrite(stream); throw e }
+        AppSettingsSync.stageAi(context, settings)
     }
 }
 
